@@ -6,8 +6,10 @@ import asyncio
 import logging
 import os
 import re
+import socket
 import sys
 import shutil
+import shlex
 import subprocess
 import time
 import unicodedata
@@ -15,22 +17,662 @@ import uuid
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from typing import Callable, List, Literal, Optional, Tuple
+from typing import Any, Callable, List, Literal, Optional, Tuple
 
+import websocket
+from obswebsocket import exceptions as obs_ws_exceptions
 from obswebsocket import obsws, requests as obs_requests
+from obswebsocket.core import RecvThread, ReconnectThread
 
 from .demo_parser import (
+    BUFFER_SECONDS_AFTER,
     TICK_RATE as DEMO_TICK_RATE,
     compute_spec_player_slot_one_based,
     get_demo_spec_calibration_tick,
     get_player_list,
     spec_player_extra_offset_for_gsi_failure,
 )
-from .env_utils import OBSConfig
+from .cs2_config_backup import (
+    is_cs2_running,
+    is_restore_required,
+    restore_latest_user_config_backup,
+    write_persistent_backup_from_snap,
+)
+from .env_utils import OBSConfig, SpecPlayerVerifyConfig
 from .gsi_ready import gsi_status, is_gsi_ready, reset_gsi_ready, wait_gsi_payload_after
+from .pov_constants import POV_CORE_FORCED_COMMANDS, pov_tail_commands
 from .win_cs2_console import ensure_cs2_foreground, find_cs2_hwnd, inject_console_sequence, send_cs2_space_taps
+from .radar.radar_data_extractor import _normalize_record_segments
 
 logger = logging.getLogger(__name__)
+
+
+class _ObswsBoundedHandshake(obsws):
+    """与 obsws 相同，但对 ``WebSocket.connect`` 传入 ``timeout``，避免无服务时长时间阻塞。"""
+
+    def __init__(
+        self,
+        host: str = "localhost",
+        port: int | str = 4444,
+        password: str = "",
+        *,
+        handshake_timeout_sec: float = 4.0,
+        legacy=None,
+        timeout: int = 60,
+        authreconnect: int = 0,
+        on_connect: Optional[Callable] = None,
+        on_disconnect: Optional[Callable] = None,
+    ):
+        self._obs_handshake_timeout_sec = max(0.5, float(handshake_timeout_sec))
+        super().__init__(
+            host,
+            port,
+            password,
+            legacy=legacy,
+            timeout=timeout,
+            authreconnect=authreconnect,
+            on_connect=on_connect,
+            on_disconnect=on_disconnect,
+        )
+
+    def connect(self):
+        try:
+            self.ws = websocket.WebSocket()
+            url = "ws://{}:{}".format(self.host, self.port)
+            logger.info(
+                "Connecting to %s (handshake timeout=%ss)...",
+                url,
+                self._obs_handshake_timeout_sec,
+            )
+            self.ws.connect(url, timeout=self._obs_handshake_timeout_sec)
+            logger.info("Connected to OBS WebSocket")
+            if self.legacy:
+                self._auth_legacy()
+            else:
+                self._auth()
+
+            if self.thread_recv is not None:
+                self.thread_recv.running = False
+            self.thread_recv = RecvThread(self)
+            self.thread_recv.daemon = True
+            self.thread_recv.start()
+            if self.on_connect:
+                self.on_connect(self)
+        except socket.error as e:
+            if self.authreconnect:
+                if not self.thread_reco:
+                    logger.warning(
+                        "Connection failed, reconnecting in %s second(s).",
+                        self.authreconnect,
+                    )
+                    self.thread_reco = ReconnectThread(self)
+                    self.thread_reco.daemon = True
+                    self.thread_reco.start()
+                else:
+                    logger.warning("Connection failed, but reconnect timer already running.")
+            else:
+                raise obs_ws_exceptions.ConnectionFailure(str(e)) from e
+
+
+def _friendly_obs_websocket_test_error(exc: BaseException) -> str:
+    """将连接异常写成玩家可读说明，避免直接展示 WinError 等技术串。"""
+    raw = str(exc)
+    low = raw.lower()
+    if "auth" in low or "password" in low or ("invalid" in low and "secret" in low):
+        return (
+            "WebSocket 密码验证失败。请在 OBS「工具 → WebSocket 服务器设置」中核对密码，并与本页填写一致。"
+        )
+    if (
+        "10061" in raw
+        or "积极拒绝" in raw
+        or "connection refused" in low
+        or "拒绝连接" in raw
+        or isinstance(exc, ConnectionRefusedError)
+    ):
+        return (
+            "无法连接到 OBS（连接被拒绝）。请确认：① OBS 已启动；② 已在 OBS「工具 → WebSocket 服务器设置」中"
+            "勾选「启用 WebSocket 服务器」；③ 端口号与本页一致（默认通常为 4455）。"
+        )
+    if "10060" in raw or "timed out" in low or ("超时" in raw and "连接" in raw):
+        return (
+            "连接 OBS 超时。请确认主机填写为 localhost 或 127.0.0.1，OBS 已运行，且防火墙未拦截该端口。"
+        )
+    if "gaierror" in low or "getaddrinfo" in low or "name or service not known" in low or "不知道这样的主机" in raw:
+        return "主机地址无效或无法解析。在本机使用时请填写 localhost 或 127.0.0.1。"
+    if "10054" in raw or "远程主机强迫关闭" in raw or "connection reset" in low:
+        return "连接被中断。请重启 OBS，并确认 WebSocket 服务器仍处于启用状态。"
+    if "10013" in raw or "访问权限" in raw and "套接字" in raw:
+        return "当前环境不允许使用该端口，可能被防火墙或安全软件拦截，请检查后重试。"
+    return (
+        "无法连接 OBS WebSocket。请先启动 OBS，在「工具 → WebSocket 服务器设置」中启用服务器，"
+        "再核对端口与密码是否与本页一致。"
+    )
+
+
+# 写入录制结果 / recorded_clips.clip_meta，供合辑工作台展示回合、比分、标签等
+_RECORDING_RESULT_CLIP_META_KEYS: tuple[str, ...] = (
+    "category",
+    "compilation_kind",
+    "round",
+    "round_won",
+    "score_own",
+    "score_opp",
+    "context_tags",
+    "kill_count",
+    "weapon_used",
+    "killer_name",
+    "victims",
+    "killers",
+    "ai_score",
+    "ai_commentary",
+    "start_tick",
+    "end_tick",
+    "map_name",
+    "target_steam_id",
+    "steamid",
+    "record_start_tick",
+    "record_end_tick",
+    "anchor_tick",
+    "pre_roll_sec",
+    "post_roll_sec",
+    "demo_tick_rate",
+    "radar_sync_offset_sec",
+    "source_ticks",
+    "source_rounds",
+    "source_round_ends",
+    "fixed_segment_pacing",
+    "freeze_to_death_round_filter",
+    "freeze_to_death_round_windows",
+    "record_segments",
+    "radar_timing",
+    "obs_recording_markers",
+    "pov_player_name",
+    "pov_steamid64",
+    "timeline_source",
+    "timeline_event_id",
+    "pov_hud_enabled",
+    "recording_perspective",
+    "victim_pov_segments",
+    "death_tick",
+    "kill_ticks",
+)
+
+
+def merge_clip_metadata_into_recording_result(out: dict[str, Any], clip: dict[str, Any]) -> dict[str, Any]:
+    """把解析阶段 clip 字典中的展示字段合并进单次录制 API 结果。"""
+    for k in _RECORDING_RESULT_CLIP_META_KEYS:
+        if k not in clip:
+            continue
+        v = clip[k]
+        if k == "record_segments":
+            prev = out.get("record_segments")
+            if isinstance(prev, list) and len(prev) > 0:
+                if not (isinstance(v, list) and len(v) > 0):
+                    continue
+        out[k] = v
+    return out
+
+
+def _clip_radar_anchor_tick(clip: dict) -> int:
+    kills = _clip_kill_ticks_sorted(clip)
+    if kills:
+        return int(kills[len(kills) // 2])
+    dt = _clip_death_tick(clip)
+    if dt is not None:
+        return int(dt)
+    st = max(0, int(clip.get("start_tick") or 0))
+    et = max(st, int(clip.get("end_tick") or 0))
+    return int((st + et) // 2)
+
+
+def _source_round_per_demo_segment(clip: dict, segments: list[tuple[int, int]]) -> list[Optional[int]]:
+    raw = clip.get("source_ticks") or []
+    if not raw or str(clip.get("category") or "").strip() != "compilation":
+        return [None] * len(segments)
+    rounds_raw = clip.get("source_rounds") or []
+    spans: list[tuple[int, int, Optional[int]]] = []
+    for idx, item in enumerate(raw):
+        try:
+            ss = int(item[0])
+            ee = int(item[1])
+        except (TypeError, ValueError, IndexError):
+            continue
+        ss = max(0, ss)
+        ee = max(ss + 1, ee)
+        try:
+            rn = int(rounds_raw[idx]) if idx < len(rounds_raw) else None
+        except (TypeError, ValueError):
+            rn = None
+        spans.append((ss, ee, rn))
+    out: list[Optional[int]] = []
+    for seg_ss, seg_ee in segments:
+        best_rn: Optional[int] = None
+        best_ov = -1
+        for ss, ee, rn in spans:
+            lo = max(seg_ss, ss)
+            hi = min(seg_ee, ee)
+            ov = hi - lo
+            if ov > best_ov:
+                best_ov = ov
+                best_rn = rn
+        out.append(best_rn)
+    return out
+
+
+def _radar_record_segments_wall_plan(
+    segments: list[tuple[int, int]],
+    *,
+    post_start_seg0: float,
+    first_seg_extra: float,
+    post_obs_resume_sec: float,
+    settle_between: float,
+    tick_rate: float,
+    source_rounds_per_seg: list[Optional[int]],
+) -> list[dict[str, Any]]:
+    """与 smart-jump 录制 sleep 结构一致的「成片视频时间 → demo tick 段」元数据（供雷达采样）。"""
+    tr = max(float(tick_rate), 0.001)
+    video_t = 0.0
+    out: list[dict[str, Any]] = []
+    for si, (ss, ee) in enumerate(segments):
+        seg_dur_demo = max(0.0, (int(ee) - int(ss)) / tr)
+        if si == 0:
+            pre_hold = float(post_start_seg0)
+            dur_video = pre_hold + seg_dur_demo + float(first_seg_extra)
+        else:
+            pre_hold = 0.0
+            dur_video = float(post_obs_resume_sec) + float(settle_between) + seg_dur_demo
+        dur_video = max(0.0, dur_video)
+        item: dict[str, Any] = {
+            "start_tick": int(ss),
+            "end_tick": int(ee),
+            "video_start_sec": float(video_t),
+            "duration_sec": float(dur_video),
+            "pre_hold_sec": float(pre_hold),
+        }
+        if si < len(source_rounds_per_seg):
+            rn = source_rounds_per_seg[si]
+            if rn is not None:
+                item["source_round"] = int(rn)
+        out.append(item)
+        video_t += dur_video
+    return out
+
+
+def _recording_radar_clip_meta_fields(
+    clip: dict,
+    *,
+    use_smart_jump: bool,
+    segments: list[tuple[int, int]],
+    meta_record_start_tick: int,
+    meta_record_end_tick: int,
+    post_start_seg0: float,
+    first_seg_extra: float,
+    settle_between: float,
+    director: Any,
+) -> dict[str, Any]:
+    tick_rate = float(TICK_RATE)
+    try:
+        sync_off = float((os.environ.get("CS2_INSIGHT_RADAR_TIMELINE_OFFSET_SEC") or "0").strip() or 0.0)
+    except (TypeError, ValueError):
+        sync_off = 0.0
+    anchor = _clip_radar_anchor_tick(clip)
+    pre_roll = max(0.0, (int(anchor) - int(meta_record_start_tick)) / tick_rate)
+    post_roll = max(0.0, (int(meta_record_end_tick) - int(anchor)) / tick_rate)
+    fields: dict[str, Any] = {
+        "demo_tick_rate": tick_rate,
+        "radar_sync_offset_sec": float(sync_off),
+        "anchor_tick": int(anchor),
+        "pre_roll_sec": float(pre_roll),
+        "post_roll_sec": float(post_roll),
+    }
+    if use_smart_jump and segments:
+        post_obs = float(director._env_float("CS2_INSIGHT_POST_OBS_RESUME_DEMO_DELAY", "0.25"))
+        rnds = _source_round_per_demo_segment(clip, segments)
+        fields["record_segments"] = _radar_record_segments_wall_plan(
+            segments,
+            post_start_seg0=float(post_start_seg0),
+            first_seg_extra=float(first_seg_extra),
+            post_obs_resume_sec=post_obs,
+            settle_between=float(settle_between),
+            tick_rate=tick_rate,
+            source_rounds_per_seg=rnds,
+        )
+    else:
+        fields["record_segments"] = []
+    return fields
+
+
+def _ffprobe_duration_sec(video_path: Path) -> Optional[float]:
+    """读取成片实际时长（秒），供 radar_timing 与视频时间轴对齐。"""
+    probe = shutil.which("ffprobe")
+    if not probe:
+        return None
+    try:
+        proc = subprocess.run(
+            [
+                probe,
+                "-v",
+                "error",
+                "-select_streams",
+                "v:0",
+                "-show_entries",
+                "stream=duration",
+                "-of",
+                "default=nokey=1:noprint_wrappers=1",
+                str(video_path),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    except (OSError, subprocess.TimeoutExpired, ValueError):
+        return None
+    if proc.returncode != 0:
+        return None
+    raw = (proc.stdout or "").strip()
+    if not raw:
+        return None
+    try:
+        d = float(raw)
+    except (TypeError, ValueError):
+        return None
+    return d if d > 0 else None
+
+
+def _build_radar_timing_payload(
+    *,
+    record_segments: list[dict[str, Any]],
+    meta_record_start_tick: int,
+    meta_record_end_tick: int,
+    anchor_tick: int,
+    tick_rate: float,
+    actual_duration_sec: float,
+) -> dict[str, Any]:
+    """
+    用 ffprobe 实际时长生成 clip_meta.radar_timing，将 video_time 仿射映射到 demo tick。
+    多段 smart-jump 时按各段 planned 时长比例缩放 wall 时间轴以贴合真实成片长度。
+    """
+    tr = max(float(tick_rate), 0.001)
+    norm = _normalize_record_segments(record_segments, tr)
+    actual = max(0.01, float(actual_duration_sec))
+
+    segs_out: list[dict[str, Any]] = []
+
+    if norm:
+        planned_ends: list[float] = []
+        for s in norm:
+            vs = float(s["video_start_sec"])
+            dur = float(s.get("duration_sec", 0.0) or 0.0)
+            planned_ends.append(vs + max(0.0, dur))
+        planned_total = max(planned_ends) if planned_ends else 0.0
+        scale = actual / max(planned_total, 0.001)
+
+        for i, s in enumerate(norm):
+            vs_base = float(s["video_start_sec"]) * scale
+            ve_base = (float(s["video_start_sec"]) + float(s.get("duration_sec", 0.0) or 0.0)) * scale
+            if ve_base <= vs_base:
+                continue
+            pre_hold = float(s.get("pre_hold_sec", 0.0) or 0.0) * scale
+            if pre_hold > 0.005 and ve_base > vs_base + pre_hold + 0.001:
+                # demo 暂停阶段（OBS 已在录制，demo 尚未开始推进）
+                segs_out.append({
+                    "segment_index": i,
+                    "video_start_sec": float(vs_base),
+                    "video_end_sec": float(vs_base + pre_hold),
+                    "type": "gap",
+                    "sync_method": "hold_or_empty",
+                })
+                vs_affine = vs_base + pre_hold
+            else:
+                vs_affine = vs_base
+            item: dict[str, Any] = {
+                "segment_index": i,
+                "video_start_sec": float(vs_affine),
+                "video_end_sec": float(ve_base),
+                "demo_start_tick": int(s["start_tick"]),
+                "demo_end_tick": int(s["end_tick"]),
+                "sync_method": "affine",
+            }
+            try:
+                rn = s.get("source_round")
+                if rn is not None:
+                    item["source_round"] = int(rn)
+            except (TypeError, ValueError):
+                pass
+            segs_out.append(item)
+        if segs_out:
+            return {
+                "version": 1,
+                "mode": "segments_affine",
+                "tick_rate_hint": float(tick_rate),
+                "segments": segs_out,
+            }
+
+    anchor = int(anchor_tick)
+    anchor_video_sec: Optional[float] = None
+    try:
+        if meta_record_end_tick > meta_record_start_tick:
+            anchor_video_sec = max(0.0, (anchor - int(meta_record_start_tick)) / tr)
+    except Exception:
+        anchor_video_sec = None
+    segs_out = [
+        {
+            "segment_index": 0,
+            "video_start_sec": 0.0,
+            "video_end_sec": float(actual),
+            "demo_start_tick": int(meta_record_start_tick),
+            "demo_end_tick": int(meta_record_end_tick),
+            "anchor_tick": anchor,
+            "anchor_video_sec": anchor_video_sec,
+            "sync_method": "affine",
+        },
+    ]
+
+    return {
+        "version": 1,
+        "mode": "segments_affine",
+        "tick_rate_hint": float(tick_rate),
+        "segments": segs_out,
+    }
+
+
+def _active_video_intervals_from_obs_markers(
+    markers: list[dict[str, Any]],
+) -> tuple[list[tuple[float, float]], float]:
+    """
+    将 OBS Start/Pause/Resume/Stop 边界（monotonic 时间戳）解析为成片内连续的视频时长区间。
+    仅在 outputPaused=false 时累积时长；Pause 期间成片时间轴不前进。
+    """
+    if not markers:
+        return [], 0.0
+    intervals: list[tuple[float, float]] = []
+    cum = 0.0
+    active_start: Optional[float] = None
+    for m in markers:
+        op = str(m.get("op") or "")
+        try:
+            t = float(m["mono"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if op == "start":
+            active_start = t
+        elif op == "resume":
+            active_start = t
+        elif op == "pause":
+            if active_start is not None:
+                dur = max(0.0, t - active_start)
+                intervals.append((cum, cum + dur))
+                cum += dur
+                active_start = None
+        elif op == "stop":
+            if active_start is not None:
+                dur = max(0.0, t - active_start)
+                intervals.append((cum, cum + dur))
+                cum += dur
+                active_start = None
+    return intervals, cum
+
+
+def _build_radar_timing_from_obs_markers(
+    *,
+    markers: list[dict[str, Any]],
+    segments: list[tuple[int, int]],
+    pov_demo_spans: list[tuple[int, int]],
+    use_smart_jump: bool,
+    meta_record_start_tick: int,
+    meta_record_end_tick: int,
+    tick_rate: float,
+    actual_duration_sec: float,
+) -> Optional[dict[str, Any]]:
+    """
+    严格按 OBS 边界打点构造 radar_timing，不做 buffer 推算。
+    若标记与 demo 段数量无法对齐则返回 None，由调用方回退到旧版仿射推算。
+    """
+    raw_intervals, model_total = _active_video_intervals_from_obs_markers(markers)
+    if not raw_intervals or model_total <= 1e-9:
+        return None
+
+    tr = max(float(tick_rate), 0.001)
+    tick_rows: list[tuple[int, int]] = []
+    if use_smart_jump and segments:
+        tick_rows = [(int(ss), int(ee)) for ss, ee in segments]
+        tick_rows.extend([(int(a), int(b)) for a, b in pov_demo_spans])
+    else:
+        tick_rows = [(int(meta_record_start_tick), int(meta_record_end_tick))]
+        tick_rows.extend([(int(a), int(b)) for a, b in pov_demo_spans])
+
+    primary_n = len(tick_rows)
+    if primary_n <= 0:
+        return None
+
+    lengths = [max(0.0, b - a) for a, b in raw_intervals]
+    total_len = sum(lengths)
+    if total_len <= 1e-9:
+        return None
+
+    actual = max(0.01, float(actual_duration_sec))
+    scale = actual / total_len
+
+    scaled: list[tuple[float, float, float]] = []
+    cum_v = 0.0
+    for L in lengths:
+        Ls = L * scale
+        scaled.append((cum_v, cum_v + Ls, Ls))
+        cum_v += Ls
+
+    segs_out: list[dict[str, Any]] = []
+    for idx in range(primary_n):
+        if idx >= len(scaled):
+            logger.warning(
+                "obs_markers radar_timing: interval shortage idx=%d need=%d have=%d",
+                idx,
+                primary_n,
+                len(scaled),
+            )
+            return None
+        vs, ve, _ = scaled[idx]
+        ss, ee = tick_rows[idx]
+        if ee <= ss:
+            return None
+        segs_out.append(
+            {
+                "segment_index": idx,
+                "video_start_sec": float(vs),
+                "video_end_sec": float(ve),
+                "demo_start_tick": int(ss),
+                "demo_end_tick": int(ee),
+                "sync_method": "affine",
+            },
+        )
+
+    for idx in range(primary_n, len(scaled)):
+        vs, ve, _ = scaled[idx]
+        segs_out.append(
+            {
+                "segment_index": idx,
+                "video_start_sec": float(vs),
+                "video_end_sec": float(ve),
+                "type": "gap",
+                "sync_method": "hold_or_empty",
+            },
+        )
+
+    return {
+        "version": 2,
+        "mode": "obs_markers",
+        "tick_rate_hint": float(tr),
+        "segments": segs_out,
+        "obs_model_duration_sec": float(model_total),
+        "uniform_scale": float(scale),
+    }
+
+
+def _video_align_log_obs_marker_chain(clip_id: str, markers: list[dict[str, Any]]) -> None:
+    """Mono timeline of OBS start/pause/resume/stop for correlating wall gaps vs muxed timeline."""
+    if not markers:
+        logger.info("[video-align] clip=%s obs_marker_chain=empty", clip_id)
+        return
+    t0 = float(markers[0]["mono"])
+    chunks: list[str] = []
+    prev = t0
+    for m in markers:
+        mono = float(m["mono"])
+        op = str(m.get("op", "?"))
+        chunks.append(f"{op}+{mono - t0:.3f}s(d{mono - prev:+.3f})")
+        prev = mono
+    logger.info("[video-align] clip=%s obs_marker_chain=%s", clip_id, " ".join(chunks))
+
+
+def _video_align_log_radar_summary(
+    clip_id: str,
+    *,
+    radar: Any,
+    ffprobe_sec: Optional[float],
+) -> None:
+    if not radar or not isinstance(radar, dict):
+        logger.info(
+            "[video-align] clip=%s ffprobe_sec=%s radar_timing=null",
+            clip_id,
+            f"{float(ffprobe_sec):.6f}" if isinstance(ffprobe_sec, (int, float)) else repr(ffprobe_sec),
+        )
+        return
+    segs = radar.get("segments")
+    if not isinstance(segs, list) or not segs:
+        logger.info(
+            "[video-align] clip=%s ffprobe_sec=%s radar=no_segments mode=%r",
+            clip_id,
+            f"{float(ffprobe_sec):.6f}" if isinstance(ffprobe_sec, (int, float)) else repr(ffprobe_sec),
+            radar.get("mode"),
+        )
+        return
+    parts: list[str] = []
+    for i, s in enumerate(segs[:12]):
+        if not isinstance(s, dict):
+            continue
+        typ = str(s.get("type") or ("main" if i == 0 else "seg"))
+        vs, ve = s.get("video_start_sec"), s.get("video_end_sec")
+        ds, de = s.get("demo_start_tick"), s.get("demo_end_tick")
+        try:
+            vsa = float(vs) if vs is not None else float("nan")
+            vea = float(ve) if ve is not None else float("nan")
+        except (TypeError, ValueError):
+            vsa = vea = float("nan")
+        parts.append(f"[{i}]{typ}v{vsa:.3f}-{vea:.3f}t{ds}-{de}")
+    _ff = (
+        f"{float(ffprobe_sec):.6f}"
+        if isinstance(ffprobe_sec, (int, float)) and ffprobe_sec is not None
+        else repr(ffprobe_sec)
+    )
+    logger.info(
+        "[video-align] clip=%s ffprobe_sec=%s radar_mode=%r model_sec=%s scale=%s segs=%s",
+        clip_id,
+        _ff,
+        radar.get("mode"),
+        radar.get("obs_model_duration_sec"),
+        radar.get("uniform_scale"),
+        " | ".join(parts),
+    )
 
 
 def _resolve_gsi_sink_url() -> str:
@@ -51,6 +693,10 @@ class RecordingAborted(Exception):
     """用户请求中止录制（中途退出批量/单次任务）。"""
 
 
+class _SpecVerifyAbort(Exception):
+    """spec_player GSI 验证耗尽所有重试次数，中止当前录制 pipeline。"""
+
+
 CS2_RUNNING_MESSAGE = "检测到 CS2 正在运行。为避免踢出对局或污染设置，请先手动退出 CS2 后再开始录制。"
 
 
@@ -64,48 +710,6 @@ class CS2NotReadyError(RuntimeError):
     sees the same warning-dialog style as the "CS2 already running" case instead
     of being silently kicked back to the queue with no feedback.
     """
-
-
-def is_cs2_running() -> bool:
-    """Return True when CS2 has either a visible window or a live cs2.exe process."""
-    if sys.platform != "win32":
-        return bool(find_cs2_hwnd())
-    if find_cs2_hwnd():
-        return True
-    try:
-        cp = subprocess.run(
-            ["tasklist", "/FI", "IMAGENAME eq cs2.exe", "/NH"],
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            timeout=5,
-        )
-        if "cs2.exe" in (cp.stdout or "").lower():
-            return True
-    except Exception as e:  # noqa: BLE001
-        logger.debug("Could not query cs2.exe via tasklist: %s", e)
-
-    try:
-        cp = subprocess.run(
-            [
-                "powershell",
-                "-NoProfile",
-                "-ExecutionPolicy",
-                "Bypass",
-                "-Command",
-                "if (Get-Process -Name cs2 -ErrorAction SilentlyContinue) { 'cs2' }",
-            ],
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            text=True,
-            timeout=5,
-        )
-        return "cs2" in (cp.stdout or "").lower()
-    except Exception as e:  # noqa: BLE001
-        logger.debug("Could not query cs2.exe via PowerShell: %s", e)
-        return False
 
 
 TICK_RATE = 64
@@ -135,82 +739,8 @@ _OBS_GAME_CAPTURE_INPUT_NAME = "CS2 Insight Game Capture"
 _RECORDING_VIDEO_EXTENSIONS = {".mkv", ".mp4", ".mov", ".flv", ".ts", ".m2ts", ".avi"}
 
 
-# ── 用户配置磁盘备份 ────────────────────────────────────────────────────
-# 每次录制启动时把玩家当前磁盘上的 CS2 配置文件原样拷一份到
-#   ``<repo>/.cs2_config_backup/``
-# 下，并写一个 ``manifest.json`` 记录每个备份文件对应的原始绝对路径。下一次录制
-# 启动时会**清空整个目录再重写**，因此项目里只会保留"最近一次录制前的玩家配置"。
-# 这样玩家原始 cfg 始终有一份在项目目录里可手动取用，运行期则继续靠 ``OBSDirector.
-# _user_config_snapshot`` 内存快照在 taskkill CS2 后自动还原。
-_BACKUP_DIR_NAME = ".cs2_config_backup"
-_BACKUP_MANIFEST_NAME = "manifest.json"
-
-
-def _backup_root() -> Path:
-    """Return the project-root backup directory.
-
-    固定指向**本仓库根**（``backend/app/obs_director.py`` → 上溯三级 = repo root），
-    不跟随 ``CS2_INSIGHT_CONFIG`` 环境变量漂移到玩家的 AppData 之类目录。
-    便携包解压到哪儿，备份就放在哪儿，方便玩家自行翻出原始 cfg。
-    """
-    try:
-        return Path(__file__).resolve().parents[2] / _BACKUP_DIR_NAME
-    except Exception:  # noqa: BLE001
-        return Path.cwd() / _BACKUP_DIR_NAME
-
-
-def _write_persistent_backup(snap: "dict[Path, Optional[bytes]]") -> Optional[Path]:
-    """清空 ``<repo>/.cs2_config_backup/`` 后把当前内存快照落盘。返回备份目录路径。"""
-    if not snap:
-        return None
-    import json
-
-    backup_dir = _backup_root()
-    try:
-        if backup_dir.exists():
-            shutil.rmtree(backup_dir, ignore_errors=True)
-        backup_dir.mkdir(parents=True, exist_ok=True)
-    except OSError as e:
-        logger.warning("Persistent backup mkdir %s failed: %s", backup_dir, e)
-        return None
-    entries: list[dict] = []
-    for idx, (orig_path, original) in enumerate(snap.items()):
-        entry: dict = {
-            "original": str(orig_path),
-            "existed": original is not None,
-        }
-        if original is not None:
-            # 文件名沿用原始 basename 便于人工阅读，前缀加序号避免不同目录下的同名碰撞
-            rel = f"{idx:04d}_{orig_path.name}"
-            target = backup_dir / rel
-            try:
-                target.write_bytes(original)
-            except OSError as e:
-                logger.warning("Persistent backup write %s failed: %s", target, e)
-                continue
-            entry["backup_relpath"] = rel
-        entries.append(entry)
-    manifest = {
-        "version": 3,
-        "created_at": time.time(),
-        "created_at_iso": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()),
-        "entries": entries,
-    }
-    try:
-        (backup_dir / _BACKUP_MANIFEST_NAME).write_text(
-            json.dumps(manifest, indent=2, ensure_ascii=False),
-            encoding="utf-8",
-        )
-    except OSError as e:
-        logger.warning("Persistent backup manifest write failed: %s", e)
-        return None
-    logger.info(
-        "Persistent backup written: %s (%d files)",
-        backup_dir,
-        len([e for e in entries if e.get("existed")]),
-    )
-    return backup_dir
-
+# 用户配置磁盘备份 / ``recording_state.json`` 见 ``cs2_config_backup`` 模块；
+# 运行期仍靠 ``_user_config_snapshot`` 在 taskkill 后配合 manifest 恢复。
 
 def _clip_kill_ticks_sorted(clip: dict) -> list[int]:
     raw = clip.get("kill_ticks")
@@ -347,13 +877,9 @@ def build_smart_jump_segments(clip: dict) -> list[tuple[int, int]]:
         return _env_int(default_env_key, int(DEMO_TICK_RATE * default_sec))
 
     PRE_FIRST = _get_override_ticks("pre_first_sec", "CS2_INSIGHT_SMART_PRE_FIRST_TICKS", 5.5)
-    # POST_LAST: 最后一杀后的缓冲。需足够长以保证 demo_gototick 关键帧对齐后击杀动画可见。
+    # 击杀后预留（POST_LAST）：每段末杀后的缓冲；智能跳剪中段与末段相同。需足够长以保证 gototick 后击杀动画可见。
     POST_LAST = _get_override_ticks("post_last_sec", "CS2_INSIGHT_SMART_POST_LAST_TICKS", 3.0)
     MAX_GAP = max(1, _get_override_ticks("max_gap_sec", "CS2_INSIGHT_SMART_MAX_GAP_TICKS", 12.0))
-    # PRE_CONT: jump-cut 后续段的预卷。CS2 Demo 关键帧间距可达 4~8 秒，1.5s 不够；
-    # 改为 5.0s 确保 demo_gototick 即使过冲最坏情况也能在击杀前稳定落帧。
-    PRE_CONT = _get_override_ticks("pre_cont_sec", "CS2_INSIGHT_SMART_PRE_CONT_TICKS", 5.0)
-    POST_MID = _get_override_ticks("post_mid_sec", "CS2_INSIGHT_SMART_POST_MID_TICKS", 1.5)
 
     # clip_min_tick = round_freeze_end_tick，防止 seg_start 穿越到上一回合黑屏区域
     clip_min_tick = max(0, int(clip.get("clip_min_tick") or 0))
@@ -376,7 +902,42 @@ def build_smart_jump_segments(clip: dict) -> list[tuple[int, int]]:
     )
 
     if not kills:
-        has_single_segment_override = any(k in override for k in ("pre_first_sec", "post_last_sec"))
+        has_single_segment_override = isinstance(override, dict) and any(
+            k in override for k in ("pre_first_sec", "post_last_sec")
+        )
+        # 纯死亡锚点（含回合时间线 death 事件）：必须压在 death_tick 附近结束。
+        # 若沿用片段整体 end_tick（建议窗 often 为死亡 +4s），CS2 死亡视角约 2s 后会把观战切到
+        # 他人，后半段录到的已不是目标画面。
+        dt_only = _clip_death_tick(clip) if not has_single_segment_override else None
+        if dt_only is not None:
+            anchor_tick = int(dt_only)
+            seg_start = max(0, anchor_tick - PRE_FIRST)
+            if clip_min_start_tick > 0:
+                seg_start = max(seg_start, clip_min_start_tick)
+            val_po = override.get("post_last_sec")
+            if val_po is not None and str(val_po).strip():
+                post_ticks = max(0, int(float(val_po) * DEMO_TICK_RATE))
+            elif str(clip.get("timeline_source") or "").strip() == "round_timeline_event":
+                post_ticks = _env_int(
+                    "CS2_INSIGHT_TIMELINE_DEATH_POST_TICKS",
+                    int(DEMO_TICK_RATE * 2.0),
+                )
+            else:
+                post_ticks = POST_LAST
+            seg_end = anchor_tick + post_ticks
+            if clip_max_tick > 0:
+                seg_end = min(seg_end, clip_max_tick)
+            if seg_end <= seg_start:
+                seg_end = seg_start + 1
+            segment = (seg_start, seg_end)
+            logger.info(
+                "[build_segments] death_only_anchor clip_id=%s anchor=%s segment=%s",
+                clip.get("clip_id"),
+                anchor_tick,
+                segment,
+            )
+            return [segment]
+
         if not has_single_segment_override:
             return [(start_tick, end_tick)]
 
@@ -415,16 +976,15 @@ def build_smart_jump_segments(clip: dict) -> list[tuple[int, int]]:
         else:
             clusters.append([t])
 
-    ncl = len(clusters)
     segments: list[tuple[int, int]] = []
     for ci, cl in enumerate(clusters):
-        pre = PRE_FIRST if ci == 0 else PRE_CONT
+        pre = PRE_FIRST
         raw_start = max(0, cl[0] - pre)
         # 对第一段强制不早于 round_freeze_end_tick 后一点点，避免把回合刚开始的杂帧录进去。
         if ci == 0 and clip_min_start_tick > 0:
             raw_start = max(raw_start, clip_min_start_tick)
         seg_start = raw_start
-        seg_end = cl[-1] + (POST_LAST if ci == ncl - 1 else POST_MID)
+        seg_end = cl[-1] + POST_LAST
         # 裁剪到回合安全上限：超出后 CS2 进入结算界面，倒退 seek 无法恢复画面
         if clip_max_tick > 0:
             seg_end = min(seg_end, clip_max_tick)
@@ -443,13 +1003,24 @@ def build_smart_jump_segments(clip: dict) -> list[tuple[int, int]]:
             else:
                 merged.append((s, e))
 
-    # 扩展最后一段以覆盖 clip end_tick（极限拆包）。
+    # 扩展最后一段以覆盖 clip.end_tick（极限拆包等：末段需长于「末杀 + post_last」）。
+    # 若 end_tick 仅落在解析器为高光写的「末杀 + BUFFER_SECONDS_AFTER」典型窗内，而用户已通过 pacing
+    # 把 post_last 缩得比该窗更短，则不得再拉长。注意：典型窗必须与 demo_parser 的 BUFFER_SECONDS_AFTER
+    # 一致，且不得复用 CS2_INSIGHT_SMART_POST_LAST_TICKS 环境变量 —— 否则用户把 env 调小后
+    # end_tick <= last_kill + env_ticks 恒为假，会误判为「拆包」而再次拉长到 clip.end_tick（约 3s）。
+    _parser_default_tail_ticks = int(float(BUFFER_SECONDS_AFTER) * float(DEMO_TICK_RATE))
     if merged and end_tick > 0:
         ls, le = merged[-1]
         if end_tick > le:
             le_ext = min(end_tick, clip_max_tick) if clip_max_tick > 0 else end_tick
             if le_ext > le:
-                merged[-1] = (ls, le_ext)
+                last_kill = kills[-1]
+                default_parser_tail_end = last_kill + _parser_default_tail_ticks
+                user_tightened_post = POST_LAST < _parser_default_tail_ticks
+                end_within_typical_parser_tail = end_tick <= default_parser_tail_end
+                if not (user_tightened_post and end_within_typical_parser_tail):
+                    merged[-1] = (ls, le_ext)
+
     # 扩展第一段以覆盖 clip start_tick（拆包后击杀）。
     if merged and start_tick > 0:
         fs, fe = merged[0]
@@ -502,10 +1073,63 @@ class RecordingWarmupExtras:
     aspect_ratio: Optional[Literal["4:3", "16:9", "16:10"]] = None
     # 若前端传入非空列表，则优先使用该顺序注入（须已含各 cvar）；否则由静态方法从布尔字段拼装
     console_cmds: Optional[tuple[str, ...]] = None
+    # 实验性 POV：与 pov_tail_commands 对应（仅 pov_enabled 时注入末尾）
+    pov_radar_mode: int = -1  # cl_drawhud_force_radar：-1 隐藏，0 显示
+    pov_teamcounter_numeric: bool = True  # cl_teamcounter_playercount_instead_of_avatars
 
 
 # CS2 视频设置「宽高比」下拉与 setting.aspectratiomode 枚举（社区常用映射）。
 _ASPECT_RATIO_VIDEOCFG_MODE: dict[str, int] = {"4:3": 0, "16:9": 1, "16:10": 2}
+
+
+def _parse_cs2_extra_launch_argv(raw: str) -> tuple[str, ...]:
+    """前端按「一条一行」写入；旧配置可为单行整段 shlex。每行单独 shlex 后拼成 argv。"""
+    text = raw or ""
+    out: list[str] = []
+    if "\n" in text or "\r" in text:
+        for line in text.splitlines():
+            s = line.strip()
+            if not s:
+                continue
+            try:
+                parts = shlex.split(s, posix=False)
+            except ValueError:
+                logger.warning("cs2_extra_launch_args line shlex failed, skip: %r", s[:120])
+                continue
+            for p in parts:
+                t = str(p).strip()
+                if t:
+                    out.append(t)
+                if len(out) >= 48:
+                    return tuple(out)
+        return tuple(out)
+    s = text.strip()
+    if not s:
+        return ()
+    try:
+        parts = shlex.split(s, posix=False)
+    except ValueError:
+        logger.warning("cs2_extra_launch_args shlex parse failed, ignoring: %r", s[:160])
+        return ()
+    for p in parts:
+        t = str(p).strip()
+        if t:
+            out.append(t)
+        if len(out) >= 48:
+            break
+    return tuple(out)
+
+
+def _parse_record_inject_console_lines(raw: str) -> tuple[str, ...]:
+    lines: list[str] = []
+    for line in (raw or "").splitlines():
+        s = line.strip()
+        if not s or s.startswith("//") or s.startswith("#"):
+            continue
+        lines.append(s[:800])
+        if len(lines) >= 60:
+            break
+    return tuple(lines)
 
 
 class OBSDirector:
@@ -518,10 +1142,17 @@ class OBSDirector:
         on_state_change: Optional[Callable[[DirectorState, str], None]] = None,
         abort_event: Optional[asyncio.Event] = None,
         cs2_fps_max: int = 240,
+        *,
+        cs2_extra_launch_args: str = "",
+        record_inject_console_lines: str = "",
+        spec_player_verify: Optional[SpecPlayerVerifyConfig] = None,
     ):
         self.obs_config = obs_config
         self.cs2_path = cs2_path
         self._cs2_fps_max: int = max(0, min(int(cs2_fps_max), 9999))
+        self._extra_launch_argv = _parse_cs2_extra_launch_argv(cs2_extra_launch_args)
+        self._extra_warmup_console_lines = _parse_record_inject_console_lines(record_inject_console_lines)
+        self._spec_player_verify = spec_player_verify or SpecPlayerVerifyConfig()
         self._ws: Optional[obsws] = None
         self._cs2_process: Optional[subprocess.Popen] = None
         self._on_state_change = on_state_change
@@ -536,6 +1167,8 @@ class OBSDirector:
         self._spec_parse_fallback_offset_by_demo: dict[str, int] = {}
         self._demo_steam_by_name_cache: dict[str, dict[str, str]] = {}
         self._abort_event = abort_event
+        # 实验性 POV：在首次片段预热注入末尾追加强制 cvar
+        self._pov_enabled = False
         # 录制期最近一次使用的 warmup 选项（预留给未来的兜底恢复路径；当前文件级
         # snapshot + restore 方案已足够保护用户配置）。
         self._last_warmup: Optional[RecordingWarmupExtras] = None
@@ -608,16 +1241,35 @@ class OBSDirector:
         demo_name = dem_path.name
         for idx in range(after_clip_idx + 1, len(clips)):
             c = clips[idx]
-            all_results.append({"clip_id": c["clip_id"], "status": "aborted", "demo_filename": demo_name})
+            all_results.append(
+                {
+                    "clip_id": c["clip_id"],
+                    "status": "aborted",
+                    "demo_path": str(dem_path),
+                    "demo_filename": demo_name,
+                },
+            )
         for j in range(job_idx + 1, len(demo_jobs)):
             dp, cls, _, _ = demo_jobs[j]
             n = dp.name
             for c in cls:
-                all_results.append({"clip_id": c["clip_id"], "status": "aborted", "demo_filename": n})
+                all_results.append(
+                    {
+                        "clip_id": c["clip_id"],
+                        "status": "aborted",
+                        "demo_path": str(dp),
+                        "demo_filename": n,
+                    },
+                )
 
     @property
     def state(self) -> DirectorState:
         return self._state
+
+    @property
+    def obs_ws(self) -> Optional[obsws]:
+        """当前 OBS WebSocket 客户端（未连接时为 ``None``）。供 OBS 配置中心等模块复用连接。"""
+        return self._ws
 
     def connect_obs(self) -> bool:
         """Establish WebSocket connection to OBS."""
@@ -643,11 +1295,24 @@ class OBSDirector:
                 pass
             self._ws = None
 
-    def test_obs_connection(self) -> dict:
-        """Quick connection test — returns version info or error."""
+    def test_obs_connection(self, *, handshake_timeout_sec: Optional[float] = None) -> dict:
+        """Quick connection test — returns version info or error.
+
+        handshake_timeout_sec:
+            传入时对 TCP + WebSocket 握手使用 ``websocket`` 的 ``connect(..., timeout=)``，
+            供 ``/api/status/setup`` 等场景避免无 OBS 时阻塞过久。录制与「测试连接」接口不传，沿用库默认。
+        """
         prev_ws = self._ws
         try:
-            ws = obsws(self.obs_config.host, self.obs_config.port, self.obs_config.password)
+            if handshake_timeout_sec is not None:
+                ws = _ObswsBoundedHandshake(
+                    self.obs_config.host,
+                    self.obs_config.port,
+                    self.obs_config.password,
+                    handshake_timeout_sec=handshake_timeout_sec,
+                )
+            else:
+                ws = obsws(self.obs_config.host, self.obs_config.port, self.obs_config.password)
             ws.connect()
             ver = ws.call(obs_requests.GetVersion())
             self._ws = ws
@@ -663,7 +1328,8 @@ class OBSDirector:
             }
         except Exception as e:
             self._ws = prev_ws
-            return {"ok": False, "error": str(e)}
+            logger.warning("OBS WebSocket test failed: %s", e, exc_info=True)
+            return {"ok": False, "error": _friendly_obs_websocket_test_error(e)}
 
     def _obs_ensure_managed_recording_scene(self) -> bool:
         """Ensure the app-owned OBS scene and game capture exist without changing the active scene."""
@@ -720,7 +1386,7 @@ class OBSDirector:
 
         if self._obs_scene_has_source(scene_name, input_name):
             self._obs_apply_managed_game_capture_settings(input_name)
-            self._obs_apply_managed_game_capture_transform(scene_name, input_name)
+            self._obs_apply_managed_game_capture_transform(scene_name, input_name, scene_item_id=None)
             self._obs_managed_input_ready = True
             logger.info("OBS managed game capture already in scene: %s", input_name)
             return True
@@ -738,9 +1404,18 @@ class OBSDirector:
 
         if input_exists:
             try:
-                self._ws.call(obs_requests.CreateSceneItem(sceneName=scene_name, sourceName=input_name))
+                cs_resp = self._ws.call(obs_requests.CreateSceneItem(sceneName=scene_name, sourceName=input_name))
+                link_sid = self._obs_scene_item_id_from_response(cs_resp)
+                if not getattr(cs_resp, "status", False):
+                    logger.warning(
+                        "OBS CreateSceneItem %r -> %r failed (status=false): %s",
+                        input_name,
+                        scene_name,
+                        getattr(cs_resp, "datain", {}),
+                    )
+                    return False
                 self._obs_apply_managed_game_capture_settings(input_name)
-                self._obs_apply_managed_game_capture_transform(scene_name, input_name)
+                self._obs_apply_managed_game_capture_transform(scene_name, input_name, scene_item_id=link_sid)
                 self._obs_managed_input_ready = True
                 logger.info("OBS managed game capture linked into scene: %s", input_name)
                 return True
@@ -750,7 +1425,7 @@ class OBSDirector:
 
         settings = self._obs_managed_game_capture_settings()
         try:
-            self._ws.call(
+            ci_resp = self._ws.call(
                 obs_requests.CreateInput(
                     sceneName=scene_name,
                     inputName=input_name,
@@ -760,7 +1435,15 @@ class OBSDirector:
                     sceneItemEnabled=True,
                 )
             )
-            self._obs_apply_managed_game_capture_transform(scene_name, input_name)
+            new_sid = self._obs_scene_item_id_from_response(ci_resp)
+            if not getattr(ci_resp, "status", False):
+                logger.warning(
+                    "OBS CreateInput game capture %r failed (status=false): %s",
+                    input_name,
+                    getattr(ci_resp, "datain", {}),
+                )
+                return False
+            self._obs_apply_managed_game_capture_transform(scene_name, input_name, scene_item_id=new_sid)
             self._obs_managed_input_ready = True
             logger.info("OBS managed game capture created: %s in %s", input_name, scene_name)
             return True
@@ -797,7 +1480,23 @@ class OBSDirector:
             logger.warning("OBS SetInputSettings game capture %r failed: %s", input_name, e)
             return False
 
-    def _obs_apply_managed_game_capture_transform(self, scene_name: str, input_name: str) -> bool:
+    @staticmethod
+    def _obs_scene_item_id_from_response(resp: Any) -> Optional[int]:
+        """Parse ``sceneItemId`` from CreateInput / CreateSceneItem response when successful."""
+        if not getattr(resp, "status", False):
+            return None
+        raw = (getattr(resp, "datain", {}) or {}).get("sceneItemId")
+        try:
+            return int(raw)
+        except (TypeError, ValueError):
+            return None
+
+    def _obs_apply_managed_game_capture_transform(
+        self,
+        scene_name: str,
+        input_name: str,
+        scene_item_id: Optional[int] = None,
+    ) -> bool:
         """Stretch the managed game capture source to the OBS canvas."""
         if not self._ws:
             return False
@@ -808,8 +1507,14 @@ class OBSDirector:
         ):
             return False
 
-        scene_item_id = self._obs_find_scene_item_id(scene_name, input_name)
-        if scene_item_id is None:
+        resolved_id = scene_item_id
+        if resolved_id is None:
+            for attempt in range(18):
+                resolved_id = self._obs_find_scene_item_id(scene_name, input_name)
+                if resolved_id is not None:
+                    break
+                time.sleep(0.05)
+        if resolved_id is None:
             logger.warning("OBS managed game capture scene item not found: %s in %s", input_name, scene_name)
             return False
 
@@ -824,30 +1529,38 @@ class OBSDirector:
             base_height = 1080
 
         transform = {
-            "positionX": 0,
-            "positionY": 0,
-            "rotation": 0,
-            "scaleX": 1,
-            "scaleY": 1,
-            "cropTop": 0,
-            "cropBottom": 0,
-            "cropLeft": 0,
-            "cropRight": 0,
+            "positionX": 0.0,
+            "positionY": 0.0,
+            "rotation": 0.0,
+            "scaleX": 1.0,
+            "scaleY": 1.0,
+            "cropTop": 0.0,
+            "cropBottom": 0.0,
+            "cropLeft": 0.0,
+            "cropRight": 0.0,
             "boundsType": os.environ.get("CS2_INSIGHT_OBS_BOUNDS_TYPE", "OBS_BOUNDS_STRETCH").strip()
             or "OBS_BOUNDS_STRETCH",
             "boundsAlignment": 5,
-            "boundsWidth": base_width,
-            "boundsHeight": base_height,
+            "boundsWidth": float(base_width),
+            "boundsHeight": float(base_height),
             "alignment": 5,
         }
         try:
-            self._ws.call(
+            set_resp = self._ws.call(
                 obs_requests.SetSceneItemTransform(
                     sceneName=scene_name,
-                    sceneItemId=scene_item_id,
+                    sceneItemId=resolved_id,
                     sceneItemTransform=transform,
                 )
             )
+            if not getattr(set_resp, "status", False):
+                logger.warning(
+                    "OBS SetSceneItemTransform failed for %r in %r: %s",
+                    input_name,
+                    scene_name,
+                    getattr(set_resp, "datain", {}),
+                )
+                return False
             logger.info("OBS managed game capture stretched to canvas: %sx%s", base_width, base_height)
             return True
         except Exception as e:
@@ -1025,7 +1738,7 @@ class OBSDirector:
             "{",
             f'  "uri" "{gsi_url}"',
             '  "timeout" "1.0"',
-            '  "buffer" "0.1"',
+            '  "buffer" "0.0"',
             '  "throttle" "0.1"',
             '  "heartbeat" "1.0"',
             '  "data"',
@@ -1035,7 +1748,11 @@ class OBSDirector:
             '    "round" "1"',
             '    "player_id" "1"',
             '    "player_state" "1"',
+            '    "player_position" "1"',
             '    "allplayers_id" "1"',
+            '    "allplayers_state" "1"',
+            '    "allplayers_position" "1"',
+            '    "allplayers_team" "1"',
             '    "phase_countdowns" "1"',
             "  }",
             "}",
@@ -1070,6 +1787,9 @@ class OBSDirector:
                 mode = _ASPECT_RATIO_VIDEOCFG_MODE.get(arm) if arm else None
                 if mode is not None:
                     argv.extend(["+setting.aspectratiomode", str(mode)])
+
+        if self._extra_launch_argv:
+            argv.extend(self._extra_launch_argv)
 
         argv.extend(["+exec", stem])
         logger.info("Launch CS2 cwd=%s cmd=%s", cwd, " ".join(argv))
@@ -1277,6 +1997,97 @@ class OBSDirector:
                 return sid
             await asyncio.sleep(0.05)
         return None
+
+    async def _spec_player_with_gsi_verify(
+        self,
+        demo_abs: Path,
+        target_steam64: str,
+        initial_slot: int,
+        mode: int = 5,
+        *,
+        max_retries: int = 4,
+        per_retry_timeout: float = 0.6,
+        settle: float = 0.12,
+        skip_console_toggle: bool = True,
+        close_console: bool = False,
+    ) -> Optional[int]:
+        """注入 spec_mode+spec_player 并通过 GSI player.steamid 验证是否切准目标玩家。
+
+        若 steamid 不符，slot+1 重试，最多 max_retries 次。
+        成功返回已确认的 slot 编号，全部重试耗尽返回 None。
+        """
+        norm_target = self._norm_steam_id(target_steam64)
+        if not norm_target:
+            logger.warning(
+                "spec_verify: invalid target_steam64=%r, skip verify demo=%s",
+                target_steam64,
+                demo_abs.name,
+            )
+            return initial_slot
+
+        known_steams: set[str] = {norm_target}
+        slot = int(initial_slot)
+        for attempt in range(max_retries):
+            self._check_abort()
+            before = float((gsi_status() or {}).get("last_payload_at") or 0.0)
+            ok = await asyncio.to_thread(
+                inject_console_sequence,
+                [f"spec_mode {mode}", f"spec_player {slot}"],
+                skip_console_toggle=skip_console_toggle,
+                close_console=close_console,
+            )
+            if not ok:
+                logger.warning(
+                    "spec_verify: inject failed slot=%d attempt=%d/%d demo=%s",
+                    slot, attempt + 1, max_retries, demo_abs.name,
+                )
+                slot += 1
+                continue
+            if settle > 0:
+                await self._sleep_abortable(settle)
+            sid = await self._await_gsi_steam_after(before, known_steams, per_retry_timeout)
+            if sid:
+                logger.info(
+                    "spec_verify: confirmed steam=%s slot=%d attempt=%d/%d demo=%s",
+                    sid, slot, attempt + 1, max_retries, demo_abs.name,
+                )
+                return slot
+            payload = (gsi_status() or {}).get("last_payload") or {}
+            got_sid = self._gsi_current_player_steam_id(payload if isinstance(payload, dict) else {})
+            logger.warning(
+                "spec_verify: slot=%d target=%s got=%s attempt=%d/%d; retrying slot+1 demo=%s",
+                slot, norm_target, got_sid, attempt + 1, max_retries, demo_abs.name,
+            )
+            slot += 1
+        logger.error(
+            "spec_verify: all %d retries exhausted for steam=%s initial_slot=%d demo=%s",
+            max_retries, norm_target, initial_slot, demo_abs.name,
+        )
+        return None
+
+    def _pov_goto_delay_extra_sec(self, clip: dict, *, pov_seek_tick: int, clip_max_tick: int) -> float:
+        """主段结束后 OBS 暂停期间，POV ``demo_gototick`` 的额外等待（叠在 jump_cut 基础 GOTO 上）。
+
+        过长会整段写入成片为「击杀后定格」。优先读 ``pacing_override.pov_goto_delay_extra_sec``，
+        其次 ``spec_player_verify.pov_goto_delay_extra_sec``；均为 None 时按倒退 tick 距离自适应。
+        """
+        vpo = clip.get("pacing_override")
+        if isinstance(vpo, dict) and vpo.get("pov_goto_delay_extra_sec") is not None:
+            try:
+                return max(0.0, min(20.0, float(vpo["pov_goto_delay_extra_sec"])))
+            except (TypeError, ValueError):
+                pass
+        forced = self._spec_player_verify.pov_goto_delay_extra_sec
+        if forced is not None:
+            return max(0.0, min(20.0, float(forced)))
+        if clip_max_tick <= 0:
+            return 1.0
+        back_delta = max(0, int(clip_max_tick) - int(pov_seek_tick))
+        if back_delta < 2048:
+            return 0.35
+        if back_delta < 10240:
+            return 1.0
+        return 2.5
 
     async def _await_gsi_allplayer_slots_after(
         self,
@@ -1526,6 +2337,8 @@ class OBSDirector:
     _USER_CONFIG_GLOB_PATTERNS: tuple[str, ...] = (
         "user_convars_0_slot*.vcfg",
         "cs2_user_convars_0_slot*.vcfg",
+        "cs2_user_keys*.vcfg",
+        "*.vcfg_lastclouded",
     )
 
     def _candidate_user_config_dirs(self) -> list[Path]:
@@ -1610,19 +2423,29 @@ class OBSDirector:
                 len([v for v in snap.values() if v is not None]),
                 [str(d) for d in self._candidate_user_config_dirs()],
             )
-            # 同步把磁盘上的玩家配置原样拷到 ``<repo>/.cs2_config_backup/``，每次录制
+            # 同步把磁盘上的玩家配置原样拷到 ``<repo>/data/.cs2_config_backup/``，每次录制
             # 启动会清空目录再重写，项目里只保留"最近一次录制前"的玩家原始 cfg。
             # 玩家事后可以在该目录翻出 config.cfg / video.txt 自行覆盖回去。
             try:
-                _write_persistent_backup(snap)
+                write_persistent_backup_from_snap(snap)
             except Exception as e:  # noqa: BLE001
                 logger.warning("Persistent disk backup failed (in-memory still active): %s", e)
 
     def _restore_user_configs(self) -> None:
-        """强杀 CS2 后对比快照，回滚所有被 CS2 运行期写脏的用户配置文件。
-        若某文件原本不存在但现在出现了（CS2 新建的污染文件），也会被删除。"""
+        """强杀 CS2 后：若 ``recording_state`` 为 ``recording`` 则按 manifest 原子恢复；
+        否则回退为内存快照对比（例如持久化备份未写入 state 的边缘情况）。"""
         snap = self._user_config_snapshot
+        if is_restore_required():
+            try:
+                res = restore_latest_user_config_backup(skip_cs2_running_check=True)
+                if res.get("ok"):
+                    self._user_config_snapshot = {}
+                    return
+                logger.warning("Manifest restore failed post-kill: %s", res)
+            except Exception as e:  # noqa: BLE001
+                logger.warning("Manifest restore raised: %s", e)
         if not snap:
+            self._user_config_snapshot = {}
             return
         restored = 0
         for p, original in snap.items():
@@ -1645,11 +2468,8 @@ class OBSDirector:
             except OSError as e:
                 logger.warning("Restore user config %s failed: %s", p, e)
         if restored:
-            logger.info("Restored %d user config file(s) post-kill", restored)
-        # 一次性生效后清空，避免 batch 场景下重复回滚。
+            logger.info("Restored %d user config file(s) post-kill (memory snapshot)", restored)
         self._user_config_snapshot = {}
-        # 磁盘备份保持原样，下一次录制启动时再被覆盖。这里不删除：项目目录里
-        # 永远留着「最近一次录制前」玩家原始 cfg 的快照供事后取用。
 
     def _kill_cs2(self) -> None:
         """强杀整棵 CS2 进程树并等待窗口真正消失。
@@ -1785,6 +2605,8 @@ class OBSDirector:
             if val:
                 return val
         stem = demo_abs.stem
+        # 成片文件名常见形如 player_de_dust2_R1_2K_xxx；在 IGNORECASE 下 [a-z0-9_]+ 会把 _R1… 吃进地图名
+        stem = re.split(r"_R\d+", stem, maxsplit=1, flags=re.IGNORECASE)[0]
         m = re.search(r"(de_[a-z0-9_]+)", stem, flags=re.IGNORECASE)
         if m:
             return m.group(1)
@@ -1845,6 +2667,60 @@ class OBSDirector:
             logger.debug("GetRecordDirectory failed: %s", e)
             return None
 
+    def _obs_snapshot_record_dir_video_paths(self) -> set[str]:
+        """录制开始前 OBS 输出目录中已有视频路径集合，用于 StopRecord 后兜底匹配新文件。"""
+        record_dir = self._obs_record_directory_path()
+        if not record_dir or not record_dir.is_dir():
+            return set()
+        out: set[str] = set()
+        try:
+            for p in record_dir.iterdir():
+                if not p.is_file() or p.suffix.lower() not in _RECORDING_VIDEO_EXTENSIONS:
+                    continue
+                try:
+                    out.add(str(p.resolve()))
+                except OSError:
+                    out.add(str(p))
+        except OSError as e:
+            logger.debug("Snapshot OBS record dir failed: %s", e)
+        return out
+
+    def _pick_new_recording_path_after_snapshot(
+        self,
+        before_paths: set[str],
+        started_at_wall: Optional[float],
+    ) -> Optional[Path]:
+        if started_at_wall is None:
+            return None
+        record_dir = self._obs_record_directory_path()
+        if not record_dir or not record_dir.is_dir():
+            return None
+        cutoff = float(started_at_wall) - 2.0
+        candidates: list[tuple[float, Path]] = []
+        try:
+            for p in record_dir.iterdir():
+                if not p.is_file() or p.suffix.lower() not in _RECORDING_VIDEO_EXTENSIONS:
+                    continue
+                try:
+                    key = str(p.resolve())
+                except OSError:
+                    key = str(p)
+                if key in before_paths:
+                    continue
+                try:
+                    st = p.stat()
+                except OSError:
+                    continue
+                if st.st_mtime >= cutoff:
+                    candidates.append((st.st_mtime, p))
+        except OSError as e:
+            logger.debug("Pick new recording file failed: %s", e)
+            return None
+        if not candidates:
+            return None
+        candidates.sort(key=lambda item: item[0], reverse=True)
+        return candidates[0][1]
+
     def _locate_recent_recording_output(self, started_at_wall: Optional[float]) -> Optional[Path]:
         if started_at_wall is None:
             return None
@@ -1891,7 +2767,7 @@ class OBSDirector:
             kills = 0
         compilation_kind = str(clip.get("compilation_kind") or "").strip()
         source_count = len(clip.get("source_ticks") or []) if isinstance(clip.get("source_ticks"), list) else 0
-        if category == "compilation" and compilation_kind in {"nemesis_deaths", "all_deaths"}:
+        if category == "compilation" and compilation_kind in {"nemesis_deaths", "all_deaths", "freeze_to_death"}:
             kill_part = f"{max(1, source_count)}D"
         elif category == "meme_death":
             kill_part = "1D"
@@ -1905,6 +2781,14 @@ class OBSDirector:
             self._safe_filename_part(kill_part, "clip"),
             self._safe_filename_part(clip_id, "clip", max_len=32),
         ]
+        jcx = clip.get("_stem_jumpcut_part")
+        if jcx is not None and str(jcx).strip():
+            try:
+                ji = int(jcx)
+            except (TypeError, ValueError):
+                ji = 0
+            if ji > 0:
+                parts.append(f"jc{ji}")
         stem = "_".join(p for p in parts if p)
         return stem[:180].strip(" ._-") or "cs2_clip"
 
@@ -1926,7 +2810,7 @@ class OBSDirector:
                 return candidate
         return source.with_name(f"{stem}_{uuid.uuid4().hex[:8]}{suffix}")
 
-    def _rename_recording_output(
+    async def _rename_recording_output(
         self,
         output_path: Optional[Path],
         clip: dict,
@@ -1937,22 +2821,26 @@ class OBSDirector:
             return {}
         source = output_path.expanduser()
         original = str(source)
-        try:
-            if not source.is_file():
-                return {"original_output_path": original, "rename_error": "OBS output file not found"}
-            stem = self._build_clip_recording_stem(clip, demo_abs, spectator_name)
-            target = self._unique_recording_target(source, stem)
-            if target != source:
-                source.rename(target)
-                logger.info("Renamed OBS recording %s -> %s", source, target)
-            return {
-                "original_output_path": original,
-                "output_path": str(target),
-                "output_filename": target.name,
-            }
-        except Exception as e:  # noqa: BLE001
-            logger.warning("Could not rename OBS recording %s: %s", original, e)
-            return {"original_output_path": original, "rename_error": str(e)}
+        for attempt in range(5):
+            try:
+                if not source.is_file():
+                    raise FileNotFoundError("OBS output file not found")
+                stem = self._build_clip_recording_stem(clip, demo_abs, spectator_name)
+                target = self._unique_recording_target(source, stem)
+                if target != source:
+                    await asyncio.to_thread(source.rename, target)
+                    logger.info("Renamed OBS recording %s -> %s", source, target)
+                return {
+                    "original_output_path": original,
+                    "output_path": str(target),
+                    "output_filename": target.name,
+                }
+            except Exception as e:  # noqa: BLE001
+                if attempt < 4:
+                    await asyncio.sleep(0.5)
+                else:
+                    logger.warning("Could not rename OBS recording %s after 5 attempts: %s", original, e)
+                    return {"original_output_path": original, "rename_error": str(e)}
 
     async def _finalize_obs_recording_rename(
         self,
@@ -1961,11 +2849,12 @@ class OBSDirector:
         demo_abs: Path,
         spectator_name: Optional[str],
         record_started_at_wall: Optional[float],
+        pre_record_video_paths: Optional[set[str]] = None,
     ) -> dict:
         """StopRecord 后对 OBS 输出文件改名：无固定前置等待；最多 5 次尝试，间隔 0.5s，成功即返回。
 
         WebSocket 已给出 ``outputPath`` 时各轮只尝试该路径（避免录制目录内误选其它成片）；
-        仅当 StopRecord 未返回路径时才按录制目录扫描兜底。
+        仅当 StopRecord 未返回路径时先按录制前目录快照匹配新文件，再按 mtime 扫描兜底。
         """
         interval = 0.5
         max_attempts = 5
@@ -1979,8 +2868,15 @@ class OBSDirector:
                 except OSError:
                     path = None
             else:
-                path = self._locate_recent_recording_output(record_started_at_wall)
-            result = self._rename_recording_output(path, clip, demo_abs, spectator_name)
+                path = None
+                if pre_record_video_paths is not None:
+                    path = self._pick_new_recording_path_after_snapshot(
+                        pre_record_video_paths,
+                        record_started_at_wall,
+                    )
+                if path is None:
+                    path = self._locate_recent_recording_output(record_started_at_wall)
+            result = await self._rename_recording_output(path, clip, demo_abs, spectator_name)
             if result.get("output_path") and not result.get("rename_error"):
                 return result
             if attempt < max_attempts:
@@ -1992,8 +2888,12 @@ class OBSDirector:
         )
         return {}
 
-    @staticmethod
-    def _recording_warmup_console_lines(w: RecordingWarmupExtras) -> list[str]:
+    def _append_config_warmup_console_lines(self, lines: list[str]) -> list[str]:
+        if not self._extra_warmup_console_lines:
+            return lines
+        return [*lines, *self._extra_warmup_console_lines]
+
+    def _recording_warmup_console_lines(self, w: RecordingWarmupExtras) -> list[str]:
         """录制会话首次 seek 前注入的观战 cvar（与空格预热后的控制台批次合并）。
 
         在所有 cvar 之前注入 ``unbindall`` + 一组最小默认绑定，把玩家自定义
@@ -2006,8 +2906,8 @@ class OBSDirector:
             cmds = [str(x).strip() for x in w.console_cmds if str(x).strip()]
             fix0 = _WARMUP_FIXED_CONSOLE_LINES[0]
             if cmds and cmds[0].strip() == fix0.strip():
-                return [*_RECORDING_KEYBIND_RESET_LINES, *cmds]
-            return [*_RECORDING_KEYBIND_RESET_LINES, fix0, *cmds]
+                return self._append_config_warmup_console_lines([*_RECORDING_KEYBIND_RESET_LINES, *cmds])
+            return self._append_config_warmup_console_lines([*_RECORDING_KEYBIND_RESET_LINES, fix0, *cmds])
         lines: list[str] = []
         lines.extend(_RECORDING_KEYBIND_RESET_LINES)
         lines.extend(_WARMUP_FIXED_CONSOLE_LINES)
@@ -2039,7 +2939,7 @@ class OBSDirector:
             lines.append("sv_grenade_trajectory_prac_pipreview 0")
             lines.append("cl_grenadepreview 0")
             lines.append("sv_grenade_trajectory_time_spectator 0")
-        return lines
+        return self._append_config_warmup_console_lines(lines)
 
     async def _prepare_clip_playback(
         self,
@@ -2053,7 +2953,7 @@ class OBSDirector:
         jump_cut_seek: bool = False,
         jump_cut_skip_leading_demo_pause: bool = False,
         goto_delay_extra: float = 0.0,
-    ) -> bool:
+    ) -> Optional[bool]:
         """
         多段注入：避免 ``demo_gototick`` 异步读盘时同批 ``spec_player`` 被引擎丢弃。
         0) 观战「预热」（默认可开，且在 **demo_gototick 之前**）：部分第三方 demo（如 5E）刚进回放
@@ -2181,6 +3081,15 @@ class OBSDirector:
         session_lines: list[str] = []
         if inject_session_warmup_cvars and warmup is not None:
             session_lines = self._recording_warmup_console_lines(warmup)
+            if self._pov_enabled:
+                session_lines = [
+                    *session_lines,
+                    *POV_CORE_FORCED_COMMANDS,
+                    *pov_tail_commands(
+                        teamcounter_numeric=warmup.pov_teamcounter_numeric,
+                        radar_mode=warmup.pov_radar_mode,
+                    ),
+                ]
         post_space_console = [*session_lines, *prime_lines]
 
         ok0 = True
@@ -2265,18 +3174,62 @@ class OBSDirector:
         await self._sleep_abortable(resume_delay)
 
         ok4 = True
+        _spec_verify_ok = True
         if spec_cmd is not None:
-            ok4 = await asyncio.to_thread(
-                _inj,
-                [f"spec_mode {mode}", spec_cmd],
-                skip=True,
-                close=False,
-            )
-            if ok4:
-                logger.info("Injected stage 4: spec_mode %s + %s", mode, spec_cmd)
+            # 尝试从 spec_cmd 解析初始槽位，并通过 GSI 验证是否切准目标玩家
+            _target_steam64: Optional[str] = None
+            if demo_abs.is_file() and pname:
+                _target_steam64 = self._demo_steam_by_name(demo_abs).get(pname.lower())
+            try:
+                _initial_slot = int(spec_cmd.split()[-1])
+            except (IndexError, ValueError):
+                _initial_slot = 0
+
+            if _target_steam64 and _initial_slot > 0 and not jump_cut_seek:
+                # ★ 核心路径：GSI 验证 + +1 重试（参数见配置 spec_player_verify）
+                # jump_cut_seek=True 时 demo 处于暂停状态，spec_player 被 CS2 静默忽略，
+                # 玩家视角不会切换（仍是上一段的正确视角），跳过 GSI 验证。
+                _spv = self._spec_player_verify
+                _max_retries = max(1, int(_spv.max_retries))
+                _per_retry_t = float(_spv.per_retry_timeout_sec)
+                _verify_settle = float(_spv.settle_sec)
+                verified_slot = await self._spec_player_with_gsi_verify(
+                    demo_abs,
+                    _target_steam64,
+                    _initial_slot,
+                    mode,
+                    max_retries=_max_retries,
+                    per_retry_timeout=_per_retry_t,
+                    settle=_verify_settle,
+                    skip_console_toggle=True,
+                    close_console=False,
+                )
+                if verified_slot is None:
+                    _spec_verify_ok = False
+                    ok4 = False
+                    logger.error(
+                        "Stage 4 spec_verify failed: name=%r steam=%s initial_slot=%s source=%s demo=%s",
+                        pname, _target_steam64, _initial_slot, spec_source, demo_abs.name,
+                    )
+                else:
+                    ok4 = True
+                    logger.info(
+                        "Stage 4 spec_verify OK: mode=%s slot=%d (initial=%d) steam=%s source=%s demo=%s",
+                        mode, verified_slot, _initial_slot, _target_steam64, spec_source, demo_abs.name,
+                    )
             else:
-                logger.warning("Console inject failed stage 4: spec_mode + %s", spec_cmd)
-            await self._sleep_abortable(spec_settle)
+                # 无 steam64 或无有效槽位时退化为单次注入（不验证）
+                ok4 = await asyncio.to_thread(
+                    _inj,
+                    [f"spec_mode {mode}", spec_cmd],
+                    skip=True,
+                    close=False,
+                )
+                if ok4:
+                    logger.info("Injected stage 4 (no-verify): spec_mode %s + %s", mode, spec_cmd)
+                else:
+                    logger.warning("Console inject failed stage 4: spec_mode + %s", spec_cmd)
+                await self._sleep_abortable(spec_settle)
 
         ok5 = await asyncio.to_thread(_inj, [close_cmd], skip=True, close=False)
         if ok5:
@@ -2284,8 +3237,16 @@ class OBSDirector:
         else:
             logger.warning("Console inject failed stage 5: %s", close_cmd)
 
-        await self._sleep_abortable(self._env_float("CS2_INSIGHT_POST_HIDE_DELAY", "0.55"))
-        await self._sleep_abortable(self._env_float("CS2_INSIGHT_PRE_RECORD_DELAY", "0.35"))
+        # POV 倒退 seek（jump_cut + 不切主视角 spec）时 OBS 常处于 PauseRecord：此处长 sleep
+        # 会直接变成成片里的「定格秒数」，与 post_last 无关；只保留极短尾部。
+        if jump_cut_seek and spec_cmd is None:
+            await self._sleep_abortable(0.05)
+            await self._sleep_abortable(0.05)
+        else:
+            await self._sleep_abortable(self._env_float("CS2_INSIGHT_POST_HIDE_DELAY", "0.55"))
+            await self._sleep_abortable(self._env_float("CS2_INSIGHT_PRE_RECORD_DELAY", "0.35"))
+        if not _spec_verify_ok:
+            return None
         if jump_cut_seek:
             return bool(ok0 and ok1 and ok4 and ok5)
         return bool(ok0 and ok1 and ok2 and ok4 and ok5)
@@ -2310,6 +3271,8 @@ class OBSDirector:
             spectator_user_id = clip["_spec_uid"]
 
         clip_id = str(clip["clip_id"])
+        player_name_for_db = (spectator_name or "").strip() or None
+
         self._check_abort()
         start_tick = max(0, int(clip["start_tick"]))
         end_tick = max(start_tick, int(clip["end_tick"]))
@@ -2321,6 +3284,8 @@ class OBSDirector:
             and str(clip.get("category") or "").strip() in ("fail", "meme_death")
         )
         _pacing_override = clip.get("pacing_override") or {}
+        if clip.get("fixed_segment_pacing"):
+            _pacing_override = {}
         has_single_segment_override = isinstance(_pacing_override, dict) and any(
             k in _pacing_override for k in ("pre_first_sec", "post_last_sec")
         )
@@ -2351,27 +3316,55 @@ class OBSDirector:
         engine_burn_ticks = int(burn_sec * TICK_RATE)
         # ========================================================
 
+        # CS2 Demo 关键帧对齐补偿：demo_gototick 会跳到目标 tick 前最近的关键帧（非精确 tick），
+        # 若 pre_first_sec 比默认值小，seek 目标更靠近击杀帧，但仍落在同一个关键帧上，
+        # 导致录制起点固定在约 5.5s 前，与用户设定无关。
+        # 修复：demo_pause 后先 demo_resume，等待多余的预滚走完，再 StartRecord。
+        # delay = max(0, calibrated_default_pre - target_pre_first)
+        _KEYFRAME_PRE_FIRST_SEC = self._env_float("CS2_INSIGHT_KEYFRAME_PRE_FIRST_SEC", "5.5")
+        _pre_first_override_val = (
+            _pacing_override.get("pre_first_sec") if isinstance(_pacing_override, dict) else None
+        )
+        _target_pre_first_sec = (
+            float(_pre_first_override_val) if _pre_first_override_val is not None else _KEYFRAME_PRE_FIRST_SEC
+        )
+        _apply_kf_delay = (
+            (has_kill_timeline or has_single_segment_override or has_death_timeline)
+            and not clip.get("fixed_segment_pacing")
+        )
+        delay_pre_sec = (
+            max(0.0, _KEYFRAME_PRE_FIRST_SEC - _target_pre_first_sec) if _apply_kf_delay else 0.0
+        )
+
         def _estimated_record_start_tick(seek: int) -> int:
             return max(0, int(seek)) + max(0, int(engine_burn_ticks))
 
         if use_smart_jump:
             # 补偿：往前多跳 engine_burn_ticks，确保 OBS 开始录制时刚好到达逻辑起点
             seek_tick = max(0, segments[0][0] - engine_burn_ticks)
+            meta_record_start_tick = _estimated_record_start_tick(seek_tick)
+            meta_record_end_tick = int(segments[-1][1])
             planned_wall_seconds = post_start_seg0 + first_seg_extra + sum(
                 max(0.0, (ee - ss) / float(TICK_RATE)) for ss, ee in segments
             )
         elif has_kill_timeline or has_single_segment_override or has_death_timeline:
             ss0, ee0 = segments[0]
             seek_tick = max(0, ss0 - engine_burn_ticks)
-            kill_seg_pad = 0.2
-            record_start_tick = _estimated_record_start_tick(seek_tick)
-            legacy_duration = max(0.0, (ee0 - record_start_tick) / float(TICK_RATE)) + kill_seg_pad
+            meta_record_start_tick = _estimated_record_start_tick(seek_tick)
+            meta_record_end_tick = int(ee0)
+            # 末杀 + post_last_sec 对应 ee0；主段 sleep 满此墙钟后立刻 PauseRecord，不再追加尾垫
+            # （旧 +0.2s 会在预留窗后又多录一截再暂停，与「击杀后预留结束即暂停」语义不一致）。
+            legacy_duration = max(0.0, (ee0 - meta_record_start_tick) / float(TICK_RATE))
             planned_wall_seconds = legacy_duration
         else:
             seek_tick = max(0, start_tick - PRE_ROLL_TICKS - engine_burn_ticks)
             tail = 0.2
-            record_start_tick = _estimated_record_start_tick(seek_tick)
-            legacy_duration = max(0.0, (end_tick - record_start_tick) / float(TICK_RATE)) + tail
+            meta_record_start_tick = _estimated_record_start_tick(seek_tick)
+            meta_record_end_tick = int(end_tick)
+            legacy_duration = max(0.0, (end_tick - meta_record_start_tick) / float(TICK_RATE)) + tail
+            if str(clip.get("timeline_source") or "").strip() == "round_timeline_round":
+                # 整回合固定 tick 窗口：墙钟略长于纯 tick 换算，抵消准备阶段少量漂移（常量，不读环境变量）。
+                legacy_duration += 0.35
             planned_wall_seconds = legacy_duration
 
         self._set_state(
@@ -2383,7 +3376,7 @@ class OBSDirector:
             if batch_new_demo_first_clip
             else 0.0
         )
-        await self._prepare_clip_playback(
+        _prep_result = await self._prepare_clip_playback(
             demo_abs,
             seek_tick,
             spectator_name,
@@ -2392,6 +3385,8 @@ class OBSDirector:
             inject_session_warmup_cvars=(clip_idx == 0),
             goto_delay_extra=goto_extra,
         )
+        if _prep_result is None:
+            raise _SpecVerifyAbort(clip_id)
 
         self._set_state(DirectorState.RECORDING, clip_id)
         cursor_bak: Optional[Tuple[int, int, int, int]] = None
@@ -2404,9 +3399,17 @@ class OBSDirector:
         _jc_burn_sec = self._env_float("CS2_INSIGHT_JC_BURN_SEC", "0.9")
         _jc_burn_ticks = int(_jc_burn_sec * TICK_RATE)
         record_started_at_wall: Optional[float] = None
+        pre_record_video_paths: set[str] = set()
         stop_record_output_path: Optional[Path] = None
         output_result: dict = {}
+        jumpcut_extra_outputs: list[dict] = []
         fatal_recording_error: Optional[str] = None
+        _victim_pov_segments: list[dict[str, Any]] = []
+        obs_timing_markers: list[dict[str, Any]] = []
+        _pov_demo_spans: list[tuple[int, int]] = []
+
+        def _mark_obs(op: str) -> None:
+            obs_timing_markers.append({"op": op, "mono": time.monotonic()})
 
         def _obs_record_paused() -> Optional[bool]:
             if not self._ws:
@@ -2445,6 +3448,7 @@ class OBSDirector:
                 self._ws.call(req())
             except Exception as e:
                 if _obs_record_paused() is True:
+                    _mark_obs("pause")
                     return True
                 logger.warning("OBS PauseRecord failed (%s); fallback to continuous recording", e)
                 return False
@@ -2466,6 +3470,7 @@ class OBSDirector:
                         if paused is None:
                             paused = getattr(resp, "outputPaused", None)
                         if paused is True:
+                            _mark_obs("pause")
                             return True
                         time.sleep(0.05)
                     if paused is False:
@@ -2478,6 +3483,7 @@ class OBSDirector:
             except Exception as e:
                 # GetRecordStatus unavailable on this OBS/plugin version — proceed optimistically
                 logger.debug("GetRecordStatus check skipped: %s", e)
+            _mark_obs("pause")
             return True
 
         def _obs_resume() -> None:
@@ -2488,13 +3494,20 @@ class OBSDirector:
                 if req is None:
                     return
                 self._ws.call(req())
+                _mark_obs("resume")
             except Exception as e:
                 logger.warning("OBS ResumeRecord failed: %s", e)
 
         try:
             if not self._ws:
-                return {"clip_id": clip_id, "status": "obs_error"}
-            # prepare 结束后到真正 StartRecord 之间要做 OBS/光标，期间若不 pause，Demo 会空转吃掉首杀前预滚
+                return {
+                    "clip_id": clip_id,
+                    "status": "obs_error",
+                    "demo_path": str(demo_abs),
+                    "demo_filename": demo_abs.name,
+                    "player_name": player_name_for_db,
+                }
+            # prepare 结束后到真正 StartRecord 之间要做 OBS/光标，期间若不 pause，Demo 会空转吃掉击杀前预留
             pause_bracket = (
                 sys.platform == "win32"
                 and os.environ.get("CS2_INSIGHT_PAUSE_DEMO_BEFORE_START_RECORD", "1").strip().lower()
@@ -2520,10 +3533,41 @@ class OBSDirector:
             ):
                 cursor_bak = self._win_cursor_corner_backup()
                 self._win_cursor_move_corner(cursor_bak)
+            pre_record_video_paths = self._obs_snapshot_record_dir_video_paths()
+
+            # 关键帧延迟：先 demo_resume，等多余预滚走完，再 StartRecord，使成片起点对齐目标。
+            demo_resumed_before_record = False
+            if pause_bracket and delay_pre_sec > 0.05:
+                ok_dr_pre = await asyncio.to_thread(
+                    inject_console_sequence,
+                    ["demo_resume"],
+                    skip_console_toggle=True,
+                    close_console=False,
+                )
+                if ok_dr_pre:
+                    demo_resumed_before_record = True
+                    logger.info(
+                        "[record] kf_delay clip=%s: default_pre=%.2fs target=%.2fs → delay StartRecord %.2fs",
+                        clip_id,
+                        _KEYFRAME_PRE_FIRST_SEC,
+                        _target_pre_first_sec,
+                        delay_pre_sec,
+                    )
+                    await asyncio.sleep(delay_pre_sec)
+                else:
+                    logger.warning(
+                        "[record] demo_resume before StartRecord failed for clip=%s; "
+                        "recording will have ~%.2fs extra pre-roll",
+                        clip_id,
+                        delay_pre_sec,
+                    )
+
             record_started_at_wall = time.time()
             self._ws.call(obs_requests.StartRecord())
+            _mark_obs("start")
 
-            if pause_bracket:
+            radar_post_start_sec = 0.0  # 从 StartRecord 到 demo 实际开始推 tick 的实测时长
+            if pause_bracket and not demo_resumed_before_record:
                 ok_dr0 = await asyncio.to_thread(
                     inject_console_sequence,
                     ["demo_resume"],
@@ -2533,17 +3577,96 @@ class OBSDirector:
                 if not ok_dr0:
                     logger.warning("demo_resume immediately after StartRecord failed")
                 await asyncio.sleep(0.08)
+                radar_post_start_sec = time.time() - record_started_at_wall
+            elif pause_bracket and demo_resumed_before_record:
+                await asyncio.sleep(0.08)
+                radar_post_start_sec = time.time() - record_started_at_wall
+
+            _va_lk_tick: Optional[int] = None
+            try:
+                _va_kills = _clip_kill_ticks_sorted(clip)
+                if _va_kills:
+                    _va_lk_tick = int(_va_kills[-1])
+            except Exception:
+                pass
+            _va_mst = int(meta_record_start_tick)
+            _va_tr = float(TICK_RATE)
+            _va_lk_linear = (
+                (_va_lk_tick - _va_mst) / _va_tr if _va_lk_tick is not None else None
+            )
+            logger.info(
+                "[video-align] clip=%s phase=start_record wall=%.6f mono=%.6f "
+                "meta_start_tick=%s meta_end_tick=%s last_kill_tick=%s "
+                "approx_last_kill_sec_if_linear_ticks=%s radar_post_start_sec=%.4f",
+                clip_id,
+                record_started_at_wall,
+                time.monotonic(),
+                meta_record_start_tick,
+                meta_record_end_tick,
+                _va_lk_tick,
+                f"{_va_lk_linear:.4f}" if _va_lk_linear is not None else "None",
+                float(radar_post_start_sec),
+            )
+
+            # 关键帧预滚：StartRecord 前已 demo_resume 并 sleep(delay_pre_sec)，demo 在片头已向前走了
+            # delay_pre_sec；StartRecord 后又 sleep(0.08) demo 仍在走。若此处仍按整段 legacy_duration
+            #（按 seg 起算的墙钟全长）去睡，会整体多录约 delay_pre_sec，击杀后预留观感被「吃掉」。
+            _rec_wall_trim = 0.0
+            if pause_bracket:
+                _rec_wall_trim += 0.08
+            if pause_bracket and demo_resumed_before_record and delay_pre_sec > 0.05:
+                _rec_wall_trim += float(delay_pre_sec)
 
             if not use_smart_jump:
-                await self._sleep_abortable(legacy_duration)
+                await self._sleep_abortable(max(0.0, float(legacy_duration) - _rec_wall_trim))
             else:
                 await self._sleep_abortable(post_start_seg0)
                 jump_cut_active = True
+                file_split_jumpcut = False
+                split_fallback_on = os.environ.get(
+                    "CS2_INSIGHT_SMART_JUMP_FILE_SPLIT_FALLBACK",
+                    "1",
+                ).strip().lower() not in ("0", "false", "no")
+
+                async def _split_close_open_obs(part_idx: int) -> None:
+                    """PauseRecord 不可用时：结束当前 OBS 文件并开始新录制，再执行段间 seek（控制台不入镜）。"""
+                    nonlocal record_started_at_wall, pre_record_video_paths
+                    stop_resp = self._ws.call(obs_requests.StopRecord())
+                    _mark_obs("stop")
+                    stop_path = self._obs_response_output_path(stop_resp)
+                    clip_tag = dict(clip)
+                    clip_tag["_stem_jumpcut_part"] = int(part_idx)
+                    part_meta = await self._finalize_obs_recording_rename(
+                        stop_path,
+                        clip_tag,
+                        demo_abs,
+                        spectator_name,
+                        record_started_at_wall,
+                        pre_record_video_paths,
+                    )
+                    if part_meta:
+                        jumpcut_extra_outputs.append(part_meta)
+                    pre_record_video_paths = self._obs_snapshot_record_dir_video_paths()
+                    record_started_at_wall = time.time()
+                    self._ws.call(obs_requests.StartRecord())
+                    _mark_obs("start")
+                    if pause_bracket:
+                        ok_dr0 = await asyncio.to_thread(
+                            inject_console_sequence,
+                            ["demo_resume"],
+                            skip_console_toggle=True,
+                            close_console=False,
+                        )
+                        if not ok_dr0:
+                            logger.warning("demo_resume after split StartRecord failed")
+                        await asyncio.sleep(0.08)
+
                 for si, (seg_start, seg_end) in enumerate(segments):
                     seg_dur = max(0.0, (seg_end - seg_start) / float(TICK_RATE))
                     if si == 0:
-                        # seg_dur 已对齐 tick 区间；first_seg_extra 默认 0，仅 env 可选微垫
-                        await self._sleep_abortable(seg_dur + first_seg_extra)
+                        # 首段与单段同理：StartRecord 前/刚开录时 demo 已先走 _rec_wall_trim 秒。
+                        seg0 = max(0.0, seg_dur + float(first_seg_extra) - _rec_wall_trim)
+                        await self._sleep_abortable(seg0)
                         continue
                     if not jump_cut_active:
                         break
@@ -2557,22 +3680,54 @@ class OBSDirector:
                     # seg_dur sleep 刚结束、demo tick 已到 seg_end，后面本不需要再录，
                     # 提前暂停对内容完整性无影响。POV 段不漏控制台就是因为外层「防结算」
                     # 已提前 OBS pause。
-                    if not _obs_pause():
-                        jump_cut_active = False
-                        fatal_recording_error = (
-                            "OBS recording pause is required for smart jump-cut, "
-                            "but PauseRecord did not enter the paused state."
-                        )
-                        logger.error(
-                            "%s clip_id=%s segment=%d/%d; stopping instead of recording a continuous tail",
-                            fatal_recording_error,
-                            clip_id,
-                            si + 1,
-                            len(segments),
-                        )
-                        break
+                    if file_split_jumpcut:
+                        await _split_close_open_obs(si)
+                    elif not _obs_pause():
+                        if split_fallback_on:
+                            logger.warning(
+                                "PauseRecord unavailable (e.g. MP4); using StopRecord/StartRecord between "
+                                "segments clip_id=%s segment=%d/%d. Prefer MKV recording format for a single file.",
+                                clip_id,
+                                si + 1,
+                                len(segments),
+                            )
+                            file_split_jumpcut = True
+                            fatal_recording_error = None
+                            await _split_close_open_obs(si)
+                        else:
+                            jump_cut_active = False
+                            fatal_recording_error = (
+                                "OBS recording pause is required for smart jump-cut, "
+                                "but PauseRecord did not enter the paused state."
+                            )
+                            logger.error(
+                                "%s clip_id=%s segment=%d/%d; stopping instead of recording a continuous tail",
+                                fatal_recording_error,
+                                clip_id,
+                                si + 1,
+                                len(segments),
+                            )
+                            break
 
                     skip_leading_pause = False
+                    # 回合合集首段往往很长：纯墙钟 sleep(seg_dur) 与 demo 实际 tick 易有漂移，
+                    # 段末可能已略过 seg_end 进入下一回合（观感像「到 R2 了」）。OBS 已 Pause 后先
+                    # demo_gototick 钳回上一段结束 tick，再执行下一段大跨度跳转，避免锚点落在错误回合。
+                    ftd_snap = (
+                        str(clip.get("compilation_kind") or "").strip() == "freeze_to_death" and si >= 1
+                    )
+                    if ftd_snap:
+                        snap_tick = max(0, int(segments[si - 1][1]))
+                        boundary_cmds = ["demo_pause", "demo_timescale 1", f"demo_gototick {snap_tick}"]
+                        logger.info(
+                            "freeze_to_death segment boundary resync snap_tick=%s before seg=%d/%d clip_id=%s",
+                            snap_tick,
+                            si + 1,
+                            len(segments),
+                            clip_id,
+                        )
+                    else:
+                        boundary_cmds = ["demo_pause"]
                     # 【demo_pause 必须 skip_console_toggle=False + close_console=True】
                     # 上一段 stage 5 用 hideconsole 关掉了控制台，这里若 skip=True 直接投
                     # WM_CHAR("demo_pause\r") 会被 CS2 主窗口丢弃（没有控制台 UI 接收）→
@@ -2585,7 +3740,7 @@ class OBSDirector:
                     # （OBS 已在上面先 pause，此时开控制台不会录进成片。）
                     ok_seg_pause = await asyncio.to_thread(
                         inject_console_sequence,
-                        ["demo_pause"],
+                        boundary_cmds,
                         skip_console_toggle=False,
                         close_console=True,
                     )
@@ -2615,6 +3770,7 @@ class OBSDirector:
                                 jump_cut_seek=True,
                                 jump_cut_skip_leading_demo_pause=skip_leading_pause,
                             )
+                            # jump_cut_seek=True 时不触发 GSI 验证，不会返回 None
                         except Exception as prep_e:
                             logger.error("prepare_clip_playback between segments failed: %s", prep_e)
                         # demo_resume 必须在 _obs_resume() 之前完成：
@@ -2640,31 +3796,81 @@ class OBSDirector:
                         _obs_resume()
                     await self._sleep_abortable(seg_dur)
 
-            # ── 主录制结束后立即暂停 OBS + demo ───────────────────────────────
-            # 最后一回合：clip_max_tick（= last_kill_tick + CS2_INSIGHT_LAST_ROUND_KILL_BUFFER_SEC*64）
-            # 就是结算界面触发 tick。sleep(seg_dur) 结束时 demo 正好在该 tick 附近，
-            # 只要再多播几十毫秒渲染器就被结算界面单向锁定，后续 POV 段倒退 seek 全部黑屏。
+            # ── 主录制墙钟结束后立刻 PauseRecord，再按需 demo_pause ─────────────
+            # 击杀后预留（post_last）已折合进 legacy_duration / 智能跳剪末段 seg_dur；
+            # sleep 结束后的第一件事应是 OBS 暂停，再执行控制台与 POV 准备（与输出格式是否
+            # 真正进入 paused 无关：仍发 PauseRecord，不支持时由 finally Resume+Stop 收尾）。
             #
-            # 【时序关键 —— 必须先 OBS 暂停，再 demo 暂停】
-            # "demo_pause" 注入自己就要 ~0.6s（开控制台 → 发字符+Enter → hideconsole）。
-            # 若先注入 demo_pause 再 _obs_pause，这 0.6s 里 OBS 仍在录制，
-            # demo 继续从 last_kill_tick 向后播 ~38 tick，结算界面会被录进主成片。
-            # 所以这里先 _obs_pause()（一个 websocket 调用，仅 ~200ms），OBS 停后
-            # demo 无论再滑多少 tick 都不会入镜；再慢条斯理地 demo_pause 让渲染器
-            # 停在击杀帧附近，供后续 POV 段倒退 seek 使用。
+            # 最后一回合：clip_max_tick 附近易触发结算界面。demo_pause 注入约 ~0.6s，
+            # 必须先 _obs_pause 再 demo_pause，否则控制台注入期间结算画面会进主成片。
+            _bridge_t0 = time.monotonic()
+            _va_lk_br: Optional[int] = None
+            try:
+                _va_k2 = _clip_kill_ticks_sorted(clip)
+                if _va_k2:
+                    _va_lk_br = int(_va_k2[-1])
+            except Exception:
+                pass
+            _va_tr_b = float(TICK_RATE)
+            _va_ms_b = int(meta_record_start_tick)
+            _va_me_b = int(meta_record_end_tick)
+            _va_span_b = (_va_me_b - _va_ms_b) / _va_tr_b
+            _va_lk_lin_b = (
+                (_va_lk_br - _va_ms_b) / _va_tr_b if _va_lk_br is not None else None
+            )
+            logger.info(
+                "[video-align] clip=%s phase=main_sleep_tick_model smart_jump=%d "
+                "meta_start=%s meta_end=%s approx_demo_span_sec_if_linear_ticks=%.4f "
+                "last_kill_tick=%s approx_last_kill_sec_if_linear_ticks=%s",
+                clip_id,
+                1 if use_smart_jump else 0,
+                meta_record_start_tick,
+                meta_record_end_tick,
+                _va_span_b,
+                _va_lk_br,
+                f"{_va_lk_lin_b:.4f}" if _va_lk_lin_b is not None else "None",
+            )
+            if not use_smart_jump:
+                _main_sleep_used = max(0.0, float(legacy_duration) - float(_rec_wall_trim))
+                logger.info(
+                    "[main-pov-bridge] clip=%s phase=main_sleep_done smart_jump=0 mono=%.3f "
+                    "legacy_duration_sec=%.4f rec_wall_trim_sec=%.4f main_sleep_sec=%.4f "
+                    "segments=%s meta_start_tick=%s meta_end_tick=%s",
+                    clip_id,
+                    _bridge_t0,
+                    float(legacy_duration),
+                    float(_rec_wall_trim),
+                    _main_sleep_used,
+                    segments,
+                    meta_record_start_tick,
+                    meta_record_end_tick,
+                )
+            else:
+                logger.info(
+                    "[main-pov-bridge] clip=%s phase=main_sleep_done smart_jump=1 mono=%.3f "
+                    "segments=%s meta_start_tick=%s meta_end_tick=%s",
+                    clip_id,
+                    _bridge_t0,
+                    segments,
+                    meta_record_start_tick,
+                    meta_record_end_tick,
+                )
+
             _clip_max_val = int(clip.get("clip_max_tick") or 0)
-            _pre_pov_obs_paused = False
+            _pre_pov_obs_paused = _obs_pause()
+            logger.info(
+                "[main-pov-bridge] clip=%s phase=post_main_obs_pause mono=%.3f dt_sec=%.3f "
+                "pause_ok=%s obs_record_paused=%s clip_max_tick=%s",
+                clip_id,
+                time.monotonic(),
+                time.monotonic() - _bridge_t0,
+                _pre_pov_obs_paused,
+                _obs_record_paused(),
+                _clip_max_val,
+            )
+            if _pre_pov_obs_paused:
+                await asyncio.sleep(0.05)
             if _clip_max_val > 0:
-                # 1) OBS 先暂停：立刻切断主视频对结算画面的录入窗口。
-                #    若 OBS 输出格式不支持 pause（MP4/部分硬编码），_obs_pause() 返回 False，
-                #    此时退化到原行为（仅 demo_pause 兜底，主视频可能多录 0.6s 结算）。
-                _pre_pov_obs_paused = _obs_pause()
-                if _pre_pov_obs_paused:
-                    await asyncio.sleep(0.05)  # 让 OBS 真正进入 PAUSED 再继续
-                # 2) 再注入 demo_pause（skip=False + close=True：当前控制台已关，
-                #    必须自己开/关控制台，否则 WM_CHAR 投不进控制台）。
-                #    即便 OBS 已 pause，这步仍然必要：POV 段要倒退 seek，若 demo 此刻
-                #    滑进结算界面渲染器会被锁定，倒退 seek 输出黑屏。
                 _ok_post_pause = await asyncio.to_thread(
                     inject_console_sequence,
                     ["demo_pause"],
@@ -2675,11 +3881,31 @@ class OBSDirector:
                     logger.warning("demo_pause after main recording failed; POV seeks may hit settlement screen")
                 else:
                     await asyncio.sleep(0.06)
+                logger.info(
+                    "[main-pov-bridge] clip=%s phase=post_main_demo_pause mono=%.3f dt_sec=%.3f ok=%s",
+                    clip_id,
+                    time.monotonic(),
+                    time.monotonic() - _bridge_t0,
+                    _ok_post_pause,
+                )
+            else:
+                logger.info(
+                    "[main-pov-bridge] clip=%s phase=post_main_demo_pause_skipped mono=%.3f dt_sec=%.3f "
+                    "reason=clip_max_tick_0",
+                    clip_id,
+                    time.monotonic(),
+                    time.monotonic() - _bridge_t0,
+                )
 
             # ── 追加 POV 段落（受害者视角 / 击杀者视角） ────────────────────────
             # 高光片段：追加每位受害者死亡前后的视角；失误片段：追加击杀者视角。
             # 开关及独立时序参数均来自 clip.pacing_override（由队列抽屉写入）。
+            # 固定 tick 分段（解析高光/合集）时禁用节奏覆写，但回合时间线入队片段仍允许受害者/击杀者 POV。
             _vpo = clip.get("pacing_override") or {}
+            _tl_src = str(clip.get("timeline_source") or "").strip()
+            _is_round_timeline = _tl_src.startswith("round_timeline")
+            if clip.get("fixed_segment_pacing") and not _is_round_timeline:
+                _vpo = {}
             if bool(_vpo.get("victim_pov", False)) or bool(_vpo.get("killer_pov", False)):
                 _clip_cat   = str(clip.get("category") or "")
                 _is_fail_pov = _clip_cat == "fail"
@@ -2707,7 +3933,7 @@ class OBSDirector:
                     _killer_name = str(clip.get("killer_name") or "").strip()
                     _death_t     = clip.get("death_tick")
                     if _want_killer_pov and _killer_name and _death_t is not None:
-                        _vic_pairs.append((_killer_name, int(_death_t), None))
+                        _vic_pairs.append((_killer_name, int(_death_t), None, "killer"))
                 else:
                     _vk_ticks  = _clip_kill_ticks_in_order(clip)
                     if _want_victim_pov:
@@ -2715,7 +3941,7 @@ class OBSDirector:
                         _vic_list  = clip.get("victims") or []
                         for _i, (_vn, _vt) in enumerate(zip(_vic_list, _vk_ticks)):
                             _nxt = int(_vk_ticks[_i + 1]) if _i + 1 < len(_vk_ticks) else None
-                            _vic_pairs.append((_vn, int(_vt), _nxt))
+                            _vic_pairs.append((_vn, int(_vt), _nxt, "victim"))
                     if _want_killer_pov:
                         _killer_list = clip.get("killers") or []
                         if not _killer_list:
@@ -2726,7 +3952,7 @@ class OBSDirector:
                             )
                             _killer_list = [_fallback_killer] * len(_vk_ticks)
                         for _kn, _kt in zip(_killer_list, _vk_ticks):
-                            _vic_pairs.append((_kn, int(_kt), None))
+                            _vic_pairs.append((_kn, int(_kt), None, "killer"))
                 _pre_vic_t  = int(_pre_vic  * DEMO_TICK_RATE)
                 _post_vic_t = int(_post_vic * DEMO_TICK_RATE)
                 _clip_min   = max(0, int(clip.get("clip_min_tick") or 0))
@@ -2750,7 +3976,7 @@ class OBSDirector:
                     int(self._env_float("CS2_INSIGHT_POV_NEXT_KILL_SAFETY_SEC", "0.15") * DEMO_TICK_RATE),
                 )
 
-                for _vname, _vtick, _next_kill_tick in _vic_pairs:
+                for _pov_i, (_vname, _vtick, _next_kill_tick, _pov_kind) in enumerate(_vic_pairs):
                     if not _vname:
                         continue
                     _vs_start = max(_clip_min, _vtick - _pre_vic_t)
@@ -2809,13 +4035,49 @@ class OBSDirector:
                     # 首次进入 POV 循环时，主录制结束处已经 _obs_pause 过（防结算兜底），
                     # OBS 对已 paused 的输出再发 PauseRecord 会返回错误 → 误判为 pause 失败 →
                     # 整段 POV break。这里用 _pre_pov_obs_paused 复用那次 pause，避免重复调用。
+                    logger.info(
+                        "[main-pov-bridge] clip=%s phase=pov_segment_begin mono=%.3f dt_sec=%.3f "
+                        "pov_index=%d/%d name=%r kind=%s seek_tick=%d vs_start=%d vs_end=%d "
+                        "record_dur_sec=%.4f pre_pov_obs_paused_flag=%s",
+                        clip_id,
+                        time.monotonic(),
+                        time.monotonic() - _bridge_t0,
+                        int(_pov_i) + 1,
+                        len(_vic_pairs),
+                        _vname,
+                        _pov_kind,
+                        int(_pov_seek_tick),
+                        int(_vs_start),
+                        int(_vs_end),
+                        float(_pov_record_dur),
+                        bool(_pre_pov_obs_paused),
+                    )
+                    _pov_reused_main_pause = bool(_pre_pov_obs_paused)
+                    _pov_pause_ok = False
                     if _pre_pov_obs_paused:
                         _pre_pov_obs_paused = False  # 仅首次复用
+                        _pov_pause_ok = True
                     elif not _obs_pause():
                         logger.warning("OBS PauseRecord failed for POV append (%s); skipping", _vname)
                         break
+                    else:
+                        _pov_pause_ok = True
+                    logger.info(
+                        "[main-pov-bridge] clip=%s phase=pov_obs_pause_done mono=%.3f dt_sec=%.3f "
+                        "name=%r reused_main_pause=%s pause_ok=%s obs_record_paused=%s",
+                        clip_id,
+                        time.monotonic(),
+                        time.monotonic() - _bridge_t0,
+                        _vname,
+                        _pov_reused_main_pause,
+                        _pov_pause_ok,
+                        _obs_record_paused(),
+                    )
+
+                    _pov_demo_spans.append((int(_vs_start), int(_vs_end)))
 
                     _ok_vdr = False
+                    _pov_skip = False  # True → spec verify 耗尽重试，跳过本 POV 段
                     try:
                         # skip_leading=False：内部完整注入 demo_pause + demo_timescale 1 + demo_gototick，
                         # 确保倒退 seek 在 demo_pause 状态下可靠触发。
@@ -2824,6 +4086,24 @@ class OBSDirector:
                         # spec_mode/spec_player 在 demo 暂停状态下发出 → CS2 静默忽略视角切换。
                         # 修正：将 spec 命令合入下方 demo_resume 注入批次，确保 demo 已恢复
                         # 播放时再切摄像机。
+                        # demo_resume 与 spec 注入须在 _obs_resume() 之前完成（OBS 仍为 PauseRecord），
+                        # 否则控制台开关会录进成片（见智能跳剪段间注释）。
+                        _pov_goto_extra = self._pov_goto_delay_extra_sec(
+                            clip,
+                            pov_seek_tick=max(0, _pov_seek_tick),
+                            clip_max_tick=_clip_max,
+                        )
+                        logger.info(
+                            "[main-pov-bridge] clip=%s phase=pov_prepare_enter mono=%.3f dt_sec=%.3f "
+                            "name=%r seek_tick=%d goto_delay_extra_sec=%.4f obs_record_paused=%s",
+                            clip_id,
+                            time.monotonic(),
+                            time.monotonic() - _bridge_t0,
+                            _vname,
+                            int(_pov_seek_tick),
+                            float(_pov_goto_extra),
+                            _obs_record_paused(),
+                        )
                         await self._prepare_clip_playback(
                             demo_abs,
                             max(0, _pov_seek_tick),
@@ -2833,14 +4113,17 @@ class OBSDirector:
                             inject_session_warmup_cvars=False,
                             jump_cut_seek=True,
                             jump_cut_skip_leading_demo_pause=False,
-                            goto_delay_extra=self._env_float("CS2_INSIGHT_POV_GOTO_DELAY_EXTRA", "3.5"),
+                            goto_delay_extra=_pov_goto_extra,
                         )
-                        # demo_resume 必须在 _obs_resume() 之前完成：
-                        # skip=False 会用 ~ 打开控制台，若在 OBS 已开始录制后才打开，
-                        # 控制台界面会录入成片。先 resume 并 close 控制台，再让 OBS 开录。
-                        # 同时重置 demo_timescale 1 防止倒退 seek 后速度归零导致画面冻结。
-                        # ★ spec_mode + spec_player 紧跟 demo_resume 发出（demo 已恢复播放），
-                        #   避免 jump_cut_seek 路径下 spec 在 demo 暂停时发出被 CS2 静默忽略。
+                        logger.info(
+                            "[main-pov-bridge] clip=%s phase=pov_prepare_exit mono=%.3f dt_sec=%.3f "
+                            "name=%r obs_record_paused=%s",
+                            clip_id,
+                            time.monotonic(),
+                            time.monotonic() - _bridge_t0,
+                            _vname,
+                            _obs_record_paused(),
+                        )
                         _raw_mode = (os.environ.get("CS2_SPEC_MODE") or "5").strip()
                         try:
                             _pov_mode = int(_raw_mode)
@@ -2852,15 +4135,13 @@ class OBSDirector:
                             _pov_slot = self._parsed_spec_slot_for_name(demo_abs, max(0, _vs_start), _vname)
                             if _pov_slot is not None:
                                 _pov_source = "parsed-fallback"
-                                logger.warning(
-                                    "POV spec calibration missed name=%r demo=%s; falling back to parsed slot=%s",
-                                    _vname,
-                                    demo_abs,
-                                    _pov_slot,
-                                )
+                        # ★ 以慢速启动 demo，让 GSI 验证期间 demo 几乎不前进。
+                        _pov_verify_timescale = float(self._spec_player_verify.demo_timescale)
+                        if _pov_verify_timescale <= 0:
+                            _pov_verify_timescale = 0.05
                         _ok_vdr = await asyncio.to_thread(
                             inject_console_sequence,
-                            ["demo_timescale 1", "demo_resume"],
+                            [f"demo_timescale {_pov_verify_timescale:g}", "demo_resume"],
                             skip_console_toggle=False,
                             close_console=True,
                         )
@@ -2869,37 +4150,108 @@ class OBSDirector:
                                 self._env_float("CS2_INSIGHT_POV_RESUME_TO_SPEC_DELAY", "0.18"),
                             )
                             if _pov_slot is not None:
-                                _spec_cmds = [f"spec_mode {_pov_mode}", f"spec_player {int(_pov_slot)}"]
-                                logger.info(
-                                    "POV spec staged name=%r slot=%s source=%s",
-                                    _vname,
-                                    _pov_slot,
-                                    _pov_source,
+                                _pov_target_steam64 = self._demo_steam_by_name(demo_abs).get(
+                                    _vname.lower() if _vname else ""
                                 )
+                                _pov_spv = self._spec_player_verify
+                                _pov_max_retries = max(1, int(_pov_spv.max_retries))
+                                _pov_per_retry_t = float(_pov_spv.per_retry_timeout_sec)
+                                _pov_verify_settle = float(_pov_spv.settle_sec)
+                                if _pov_target_steam64:
+                                    verified_pov_slot = await self._spec_player_with_gsi_verify(
+                                        demo_abs,
+                                        _pov_target_steam64,
+                                        int(_pov_slot),
+                                        _pov_mode,
+                                        max_retries=_pov_max_retries,
+                                        per_retry_timeout=_pov_per_retry_t,
+                                        settle=_pov_verify_settle,
+                                        skip_console_toggle=False,
+                                        close_console=True,
+                                    )
+                                    if verified_pov_slot is None:
+                                        logger.warning(
+                                            "POV spec_verify failed name=%r demo=%s; skipping segment",
+                                            _vname, demo_abs.name,
+                                        )
+                                        _pov_skip = True
+                                        _ok_vdr = False
+                                    else:
+                                        logger.info(
+                                            "POV spec_verify OK name=%r slot=%d (initial=%d) source=%s",
+                                            _vname, verified_pov_slot, int(_pov_slot), _pov_source,
+                                        )
+                                else:
+                                    _spec_cmds = [f"spec_mode {_pov_mode}", f"spec_player {int(_pov_slot)}"]
+                                    logger.info(
+                                        "POV spec (no-verify, no-steam64) name=%r slot=%s source=%s",
+                                        _vname, _pov_slot, _pov_source,
+                                    )
+                                    _ok_vdr = await asyncio.to_thread(
+                                        inject_console_sequence,
+                                        _spec_cmds,
+                                        skip_console_toggle=False,
+                                        close_console=True,
+                                    )
                             elif _vname:
                                 logger.warning(
-                                    "POV spec calibration missed name=%r demo=%s; skipping name-based spec_player fallback",
-                                    _vname,
-                                    demo_abs,
+                                    "POV spec: no slot for name=%r demo=%s; skipping spec_player",
+                                    _vname, demo_abs,
                                 )
-                                _spec_cmds = []
-                            else:
-                                _spec_cmds = []
-                            if _spec_cmds:
-                                _ok_vdr = await asyncio.to_thread(
+                            if not _pov_skip:
+                                await asyncio.to_thread(
                                     inject_console_sequence,
-                                    _spec_cmds,
+                                    ["demo_timescale 1"],
                                     skip_console_toggle=False,
                                     close_console=True,
                                 )
-                        if _ok_vdr:
+                        if _ok_vdr and not _pov_skip:
                             await self._sleep_abortable(_pov_post_resume_delay)
                             await self._sleep_abortable(settle_between)
                     finally:
-                        _obs_resume()
+                        # 仅在 spec 验证成功时恢复 OBS 录制；验证失败时 OBS 保持暂停，跳过本段
+                        logger.info(
+                            "[main-pov-bridge] clip=%s phase=pov_pre_obs_resume mono=%.3f dt_sec=%.3f "
+                            "name=%r pov_skip=%s ok_vdr=%s obs_record_paused=%s",
+                            clip_id,
+                            time.monotonic(),
+                            time.monotonic() - _bridge_t0,
+                            _vname,
+                            bool(_pov_skip),
+                            bool(_ok_vdr),
+                            _obs_record_paused(),
+                        )
+                        if not _pov_skip:
+                            if record_started_at_wall is not None:
+                                logger.info(
+                                    "[video-align] clip=%s phase=pov_wall_before_resume "
+                                    "pov_i=%s name=%r wall_since_start_record=%.4f mono=%.6f "
+                                    "dt_from_main_sleep=%.4f",
+                                    clip_id,
+                                    _pov_i,
+                                    _vname,
+                                    time.time() - float(record_started_at_wall),
+                                    time.monotonic(),
+                                    time.monotonic() - _bridge_t0,
+                                )
+                            _obs_resume()
 
+                    if _pov_skip:
+                        logger.warning(
+                            "POV segment skipped (spec_verify exhausted) name=%r kind=%s demo=%s",
+                            _vname, _pov_kind, demo_abs.name,
+                        )
+                        continue
                     if not _ok_vdr:
                         logger.warning("POV resume/spec injection failed for %s; segment may be unstable", _vname)
+                    _victim_pov_segments.append(
+                        {
+                            "player_name": str(_vname),
+                            "duration_sec": round(float(_pov_record_dur), 4),
+                            "anchor_tick": int(_vtick),
+                            "perspective_type": str(_pov_kind),
+                        }
+                    )
                     await self._sleep_abortable(_pov_record_dur)
 
                 # 最后一回合：POV 全部录完后立即 OBS 暂停 + demo_pause。
@@ -2927,9 +4279,11 @@ class OBSDirector:
                         req_resume = getattr(obs_requests, "ResumeRecord", None)
                         if req_resume is not None:
                             self._ws.call(req_resume())
+                            _mark_obs("resume")
                     except Exception:
                         pass  # 未暂停时 OBS 可能返回错误，忽略即可
                     stop_resp = self._ws.call(obs_requests.StopRecord())
+                    _mark_obs("stop")
                     stop_record_output_path = self._obs_response_output_path(stop_resp)
             except Exception as se:
                 logger.debug("StopRecord: %s", se)
@@ -2948,25 +4302,104 @@ class OBSDirector:
                     demo_abs,
                     spectator_name,
                     record_started_at_wall,
+                    pre_record_video_paths,
                 )
 
         self._set_state(DirectorState.STOPPING, clip_id)
+        radar_clip_meta = _recording_radar_clip_meta_fields(
+            clip,
+            use_smart_jump=use_smart_jump,
+            segments=segments,
+            meta_record_start_tick=int(meta_record_start_tick),
+            meta_record_end_tick=int(meta_record_end_tick),
+            post_start_seg0=float(radar_post_start_sec),
+            first_seg_extra=float(first_seg_extra),
+            settle_between=float(settle_between),
+            director=self,
+        )
+        if obs_timing_markers:
+            radar_clip_meta["obs_recording_markers"] = list(obs_timing_markers)
+        _ffprobe_sec_for_log: Optional[float] = None
+        try:
+            _op = (output_result or {}).get("output_path")
+            if _op:
+                _dur_actual = _ffprobe_duration_sec(Path(str(_op)))
+                _ffprobe_sec_for_log = _dur_actual
+                if _dur_actual is not None:
+                    legacy_rt = _build_radar_timing_payload(
+                        record_segments=list(radar_clip_meta.get("record_segments") or []),
+                        meta_record_start_tick=int(meta_record_start_tick),
+                        meta_record_end_tick=int(meta_record_end_tick),
+                        anchor_tick=int(radar_clip_meta.get("anchor_tick") or _clip_radar_anchor_tick(clip)),
+                        tick_rate=float(TICK_RATE),
+                        actual_duration_sec=float(_dur_actual),
+                    )
+                    strict_rt = _build_radar_timing_from_obs_markers(
+                        markers=list(obs_timing_markers),
+                        segments=list(segments),
+                        pov_demo_spans=list(_pov_demo_spans),
+                        use_smart_jump=use_smart_jump,
+                        meta_record_start_tick=int(meta_record_start_tick),
+                        meta_record_end_tick=int(meta_record_end_tick),
+                        tick_rate=float(TICK_RATE),
+                        actual_duration_sec=float(_dur_actual),
+                    )
+                    if strict_rt is not None:
+                        radar_clip_meta["radar_timing"] = strict_rt
+                        radar_clip_meta["record_segments"] = []
+                    else:
+                        radar_clip_meta["radar_timing"] = legacy_rt
+        except Exception as _rt_exc:
+            logger.warning("radar_timing 构建失败（将依赖旧时间轴）: %s", _rt_exc)
+        _video_align_log_obs_marker_chain(clip_id, list(obs_timing_markers or []))
+        _video_align_log_radar_summary(
+            clip_id,
+            radar=radar_clip_meta.get("radar_timing"),
+            ffprobe_sec=_ffprobe_sec_for_log,
+        )
         if fatal_recording_error:
-            return {
+            err_out: dict[str, Any] = {
                 "clip_id": clip_id,
                 "status": "error",
                 "error": fatal_recording_error,
                 "duration": planned_wall_seconds,
                 "smart_jump_segments": len(segments) if use_smart_jump else 1,
+                "player_name": player_name_for_db,
+                "record_start_tick": meta_record_start_tick,
+                "record_end_tick": meta_record_end_tick,
                 **output_result,
             }
-        return {
+            merge_clip_metadata_into_recording_result(err_out, clip)
+            err_out.update(radar_clip_meta)
+            return err_out
+        ok_out: dict[str, Any] = {
             "clip_id": clip_id,
             "status": "recorded",
             "duration": planned_wall_seconds,
             "smart_jump_segments": len(segments) if use_smart_jump else 1,
+            "player_name": player_name_for_db,
+            "record_start_tick": meta_record_start_tick,
+            "record_end_tick": meta_record_end_tick,
             **output_result,
         }
+        if jumpcut_extra_outputs:
+            _parts = [x.get("output_path") for x in jumpcut_extra_outputs if x.get("output_path")]
+            if _parts:
+                ok_out["smart_jump_split_files"] = _parts
+                ok_out["smart_jump_file_split_used"] = True
+        merge_clip_metadata_into_recording_result(ok_out, clip)
+        ok_out.update(radar_clip_meta)
+        ok_out["pov_hud_enabled"] = bool(getattr(self, "_pov_enabled", False))
+        if getattr(self, "_pov_enabled", False):
+            ok_out["recording_perspective"] = "pov_hud"
+        elif player_name_for_db:
+            ok_out["recording_perspective"] = "player_follow"
+        else:
+            ok_out["recording_perspective"] = "spectator"
+        ok_out["victim_pov_segments"] = list(_victim_pov_segments)
+        ok_out["death_tick"] = _clip_death_tick(clip)
+        ok_out["kill_ticks"] = list(_clip_kill_ticks_in_order(clip))
+        return ok_out
 
     def _obs_apply_hide_cursor_inputs(self) -> None:
         """录制前关闭各输入源的「采集光标」（OBS 5 SetInputSettings capture_cursor）。"""
@@ -3070,6 +4503,8 @@ class OBSDirector:
         spectator_name: Optional[str] = None,
         spectator_user_id: Optional[int] = None,
         warmup: Optional[RecordingWarmupExtras] = None,
+        *,
+        pov_enabled: bool = False,
     ) -> list[dict]:
         """
         Full pipeline: copy demo -> game/csgo, launch CS2 +playdemo -> OBS record -> cleanup.
@@ -3078,6 +4513,7 @@ class OBSDirector:
         """
         results: list[dict] = []
 
+        self._pov_enabled = bool(pov_enabled)
         try:
             self._launch_cs2(demo_abs, warmup)
             self._set_state(DirectorState.LOADING_DEMO, str(demo_abs))
@@ -3085,20 +4521,34 @@ class OBSDirector:
 
             if not self.connect_obs():
                 self._set_state(DirectorState.ERROR, "Cannot connect to OBS")
-                return [{"clip_id": c["clip_id"], "status": "obs_error"} for c in clips]
+                return [
+                    {
+                        "clip_id": c["clip_id"],
+                        "status": "obs_error",
+                        "demo_path": str(demo_abs),
+                        "demo_filename": demo_abs.name,
+                    }
+                    for c in clips
+                ]
 
             self._set_state(DirectorState.LOADING_DEMO, str(demo_abs))
             load_ok = False
             try:
                 await self._sleep_abortable(8.0)
                 await self._await_cs2_window(40.0)
-                await self._calibrate_spec_players_for_demo(demo_abs)
                 load_ok = True
             except RecordingAborted:
                 logger.info("Recording aborted by user (pre-clip)")
                 await self._run_cleanup_step("OBS StopRecord after abort", self._safe_stop_obs_recording, timeout=10.0)
                 for c in clips:
-                    results.append({"clip_id": c["clip_id"], "status": "aborted"})
+                    results.append(
+                        {
+                            "clip_id": c["clip_id"],
+                            "status": "aborted",
+                            "demo_path": str(demo_abs),
+                            "demo_filename": demo_abs.name,
+                        },
+                    )
 
             if load_ok:
                 for clip_idx, clip in enumerate(clips):
@@ -3113,7 +4563,39 @@ class OBSDirector:
                             clip_idx=clip_idx,
                             warmup=warmup,
                         )
+                        one["demo_path"] = str(demo_abs)
+                        one["demo_filename"] = demo_abs.name
+                        merge_clip_metadata_into_recording_result(one, clip)
                         results.append(one)
+                    except _SpecVerifyAbort:
+                        logger.error(
+                            "spec_player GSI verify exhausted retries for clip %s; aborting pipeline",
+                            clip_id,
+                        )
+                        await self._run_cleanup_step(
+                            "OBS StopRecord after spec verify failure",
+                            self._safe_stop_obs_recording,
+                            timeout=10.0,
+                        )
+                        results.append(
+                            {
+                                "clip_id": clip_id,
+                                "status": "spec_verify_failed",
+                                "error": "GSI验证失败：切换玩家视角重试均未成功，中止录制",
+                                "demo_path": str(demo_abs),
+                                "demo_filename": demo_abs.name,
+                            },
+                        )
+                        for c in clips[clip_idx + 1:]:
+                            results.append(
+                                {
+                                    "clip_id": c["clip_id"],
+                                    "status": "aborted",
+                                    "demo_path": str(demo_abs),
+                                    "demo_filename": demo_abs.name,
+                                },
+                            )
+                        break
                     except RecordingAborted:
                         logger.info("Recording aborted by user at clip %s", clip_id)
                         await self._run_cleanup_step(
@@ -3121,9 +4603,23 @@ class OBSDirector:
                             self._safe_stop_obs_recording,
                             timeout=10.0,
                         )
-                        results.append({"clip_id": clip_id, "status": "aborted"})
+                        results.append(
+                            {
+                                "clip_id": clip_id,
+                                "status": "aborted",
+                                "demo_path": str(demo_abs),
+                                "demo_filename": demo_abs.name,
+                            },
+                        )
                         for c in clips[clip_idx + 1:]:
-                            results.append({"clip_id": c["clip_id"], "status": "aborted"})
+                            results.append(
+                                {
+                                    "clip_id": c["clip_id"],
+                                    "status": "aborted",
+                                    "demo_path": str(demo_abs),
+                                    "demo_filename": demo_abs.name,
+                                },
+                            )
                         break
                     except Exception as e:
                         logger.error("Recording failed for %s: %s", clip_id, e)
@@ -3131,7 +4627,15 @@ class OBSDirector:
                             self._obs_restore_hide_cursor_inputs()
                         except Exception:
                             pass
-                        results.append({"clip_id": clip_id, "status": "error", "error": str(e)})
+                        results.append(
+                            {
+                                "clip_id": clip_id,
+                                "status": "error",
+                                "error": str(e),
+                                "demo_path": str(demo_abs),
+                                "demo_filename": demo_abs.name,
+                            },
+                        )
 
         except RecordingAborted:
             self._set_state(DirectorState.STOPPING, "aborted")
@@ -3139,6 +4643,7 @@ class OBSDirector:
             self._set_state(DirectorState.ERROR, str(e))
             raise
         finally:
+            self._pov_enabled = False
             await self._cleanup_recording_session()
             self._set_state(DirectorState.COMPLETED)
 
@@ -3148,6 +4653,8 @@ class OBSDirector:
         self,
         demo_jobs: list[tuple[Path, list[dict], Optional[str], Optional[int]]],
         warmup: Optional[RecordingWarmupExtras] = None,
+        *,
+        pov_enabled: bool = False,
     ) -> list[dict]:
         """
         多 Demo 批量录制：OBS 全程保持连接；每个 Demo 启动 CS2 → 录完该 Demo 全部片段 → 关闭游戏，再下一个。
@@ -3159,6 +4666,7 @@ class OBSDirector:
         if not demo_jobs:
             return all_results
 
+        self._pov_enabled = bool(pov_enabled)
         try:
             if not self.connect_obs():
                 self._set_state(DirectorState.ERROR, "Cannot connect to OBS")
@@ -3166,7 +4674,12 @@ class OBSDirector:
                     df = dem_path.name
                     for c in clips:
                         all_results.append(
-                            {"clip_id": c["clip_id"], "status": "obs_error", "demo_filename": df},
+                            {
+                                "clip_id": c["clip_id"],
+                                "status": "obs_error",
+                                "demo_path": str(dem_path),
+                                "demo_filename": df,
+                            },
                         )
                 return all_results
 
@@ -3204,6 +4717,7 @@ class OBSDirector:
                                 "clip_id": c["clip_id"],
                                 "status": "error",
                                 "error": str(e),
+                                "demo_path": str(demo_abs),
                                 "demo_filename": demo_name,
                             },
                         )
@@ -3229,7 +4743,6 @@ class OBSDirector:
                                 len(demo_jobs),
                             )
                             await self._sleep_abortable(batch_settle)
-                    await self._calibrate_spec_players_for_demo(demo_abs)
                 except RecordingAborted:
                     logger.info("Batch recording aborted by user (pre-clip) for %s", demo_name)
                     await self._run_cleanup_step("OBS StopRecord after abort", self._safe_stop_obs_recording, timeout=10.0)
@@ -3259,7 +4772,37 @@ class OBSDirector:
                             batch_new_demo_first_clip=(job_idx > 0 and clip_idx == 0),
                         )
                         one["demo_filename"] = demo_name
+                        one["demo_path"] = str(demo_abs)
+                        merge_clip_metadata_into_recording_result(one, clip)
                         all_results.append(one)
+                    except _SpecVerifyAbort:
+                        logger.error(
+                            "Batch spec_player GSI verify exhausted retries for clip %s; aborting pipeline",
+                            clip_id,
+                        )
+                        await self._run_cleanup_step(
+                            "OBS StopRecord after spec verify failure",
+                            self._safe_stop_obs_recording,
+                            timeout=10.0,
+                        )
+                        all_results.append(
+                            {
+                                "clip_id": clip_id,
+                                "status": "spec_verify_failed",
+                                "error": "GSI验证失败：切换玩家视角重试均未成功，中止录制",
+                                "demo_path": str(demo_abs),
+                                "demo_filename": demo_name,
+                            },
+                        )
+                        OBSDirector._append_aborted_results_for_tail(demo_jobs, job_idx, clip_idx, all_results)
+                        await self._run_cleanup_step("CS2 shutdown after spec verify failure", self._kill_cs2, timeout=30.0)
+                        await self._run_cleanup_step(
+                            "CS2 artifact cleanup after spec verify failure",
+                            self._cleanup_cs2_artifacts,
+                            timeout=8.0,
+                        )
+                        batch_aborted = True
+                        break
                     except RecordingAborted:
                         logger.info("Batch recording aborted by user at clip %s", clip_id)
                         await self._run_cleanup_step(
@@ -3268,7 +4811,12 @@ class OBSDirector:
                             timeout=10.0,
                         )
                         all_results.append(
-                            {"clip_id": clip_id, "status": "aborted", "demo_filename": demo_name},
+                            {
+                                "clip_id": clip_id,
+                                "status": "aborted",
+                                "demo_path": str(demo_abs),
+                                "demo_filename": demo_name,
+                            },
                         )
                         OBSDirector._append_aborted_results_for_tail(demo_jobs, job_idx, clip_idx, all_results)
                         await self._run_cleanup_step("CS2 shutdown after abort", self._kill_cs2, timeout=30.0)
@@ -3286,7 +4834,13 @@ class OBSDirector:
                         except Exception:
                             pass
                         all_results.append(
-                            {"clip_id": clip_id, "status": "error", "error": str(e), "demo_filename": demo_name},
+                            {
+                                "clip_id": clip_id,
+                                "status": "error",
+                                "error": str(e),
+                                "demo_path": str(demo_abs),
+                                "demo_filename": demo_name,
+                            },
                         )
 
                 if batch_aborted:
@@ -3305,6 +4859,7 @@ class OBSDirector:
             self._set_state(DirectorState.ERROR, str(e))
             raise
         finally:
+            self._pov_enabled = False
             await self._cleanup_recording_session()
             self._set_state(DirectorState.COMPLETED)
 

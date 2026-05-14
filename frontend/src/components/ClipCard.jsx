@@ -1,7 +1,10 @@
 import { Flame, Skull, Check, Clapperboard, Film } from "lucide-react";
+import RoundMontageRoundPicker from "./RoundMontageRoundPicker";
 import { describeTag } from "../utils/tagDescriptions";
+import { isFreezeToDeathCompilation } from "../utils/freezeToDeathRoundFilter";
+import { isTimelineSourceClip } from "../utils/montageUtils";
 
-const CATEGORY_CONFIG = {
+export const CLIP_CATEGORY_CONFIG = {
   highlight: {
     icon: Flame,
     color: "text-cs2-highlight",
@@ -83,33 +86,39 @@ export function AiScoreBadge({ score }) {
   );
 }
 
-function namesDiffer(a, b) {
-  const s = (v) => String(v ?? "").trim();
-  return s(a) !== "" && s(a) !== s(b);
-}
-
 export default function ClipCard({
   clip,
   targetPlayer = "",
   selected,
   onToggle,
-  aiMode: _aiMode,
+  aiMode = false,
   inQueue = false,
+  matchTotalRounds = 24,
+  freezeToDeathDraft = { picked: [] },
+  onFreezeToDeathDraftChange,
+  roundMontagePickerDisabled = false,
 }) {
-  const cat = CATEGORY_CONFIG[clip.category] || CATEGORY_CONFIG.highlight;
+  const isRoundMontage = isFreezeToDeathCompilation(clip);
+  const ftdPicked = freezeToDeathDraft?.picked || [];
+  const ftdEnqueueBlocked = isRoundMontage && ftdPicked.length === 0;
+
+  const cat = CLIP_CATEGORY_CONFIG[clip.category] || CLIP_CATEGORY_CONFIG.highlight;
   const Icon = cat.icon;
 
   const showKillerBadge =
-    clip.category === "fail" && namesDiffer(clip.killer_name, targetPlayer);
+    clip.category === "fail" && String(clip.killer_name ?? "").trim() !== "";
 
   const victimsList = Array.isArray(clip.victims) ? clip.victims.filter(Boolean) : [];
-  const showVictimsBadge =
-    clip.category === "highlight" &&
-    clip.kill_count !== 5 &&
-    victimsList.length > 0;
+  const showVictimsBadge = clip.category === "highlight" && victimsList.length > 0;
 
+  const suppressAiRuiPing =
+    clip.category === "compilation" || isTimelineSourceClip(clip);
+  const showAiUi = Boolean(aiMode) && !suppressAiRuiPing;
+
+  const aiCommentary = [clip.ai_commentary, clip.ai_comment]
+    .map((x) => String(x ?? "").trim())
+    .find(Boolean);
   const hasAiScore = normalizeAiScore(clip.ai_score) != null;
-  const aiCommentary = String(clip.ai_commentary ?? "").trim();
 
   const hasScore = clip.score_own != null && clip.score_opp != null;
 
@@ -120,11 +129,14 @@ export default function ClipCard({
   return (
     <div
       role="button"
-      aria-disabled={inQueue}
-      tabIndex={inQueue ? -1 : 0}
-      onClick={() => !inQueue && clip.client_clip_uid && onToggle(clip.client_clip_uid)}
+      aria-disabled={inQueue || ftdEnqueueBlocked}
+      tabIndex={inQueue || ftdEnqueueBlocked ? -1 : 0}
+      onClick={() => {
+        if (inQueue || ftdEnqueueBlocked || !clip.client_clip_uid) return;
+        onToggle(clip.client_clip_uid);
+      }}
       onKeyDown={(e) => {
-        if (inQueue || !clip.client_clip_uid) return;
+        if (inQueue || ftdEnqueueBlocked || !clip.client_clip_uid) return;
         if (e.key === "Enter" || e.key === " ") {
           e.preventDefault();
           onToggle(clip.client_clip_uid);
@@ -133,14 +145,16 @@ export default function ClipCard({
       className={`group relative rounded-xl border transition-all duration-200 bg-cs2-bg-card ${
         inQueue
           ? "cursor-not-allowed border-white/[0.06] opacity-[0.72]"
-          : `cursor-pointer hover:shadow-lg ${
-              selected
-                ? "border-cs2-orange shadow-lg shadow-cs2-orange/10"
-                : "border-cs2-border hover:border-cs2-border"
-            }`
+          : ftdEnqueueBlocked
+            ? "cursor-not-allowed border-amber-500/20 opacity-[0.85]"
+            : `cursor-pointer hover:shadow-lg ${
+                selected
+                  ? "border-cs2-orange shadow-lg shadow-cs2-orange/10"
+                  : "border-cs2-border hover:border-cs2-border"
+              }`
       }`}
     >
-      {hasAiScore && (
+      {showAiUi && hasAiScore && (
         <div className="absolute right-11 top-3 z-10 max-w-[calc(100%-5.5rem)] sm:right-12">
           <AiScoreBadge score={clip.ai_score} />
         </div>
@@ -156,7 +170,13 @@ export default function ClipCard({
               : "border border-cs2-border bg-cs2-bg-input group-hover:border-cs2-orange/40"
         }`}
       >
-        {inQueue ? "队列" : selected ? <Check className="h-3 w-3 text-black" /> : null}
+        {inQueue ? (
+          "队列"
+        ) : ftdEnqueueBlocked ? (
+          <span className="px-0.5 text-[8px] font-bold leading-none text-amber-500/90">—</span>
+        ) : selected ? (
+          <Check className="h-3 w-3 text-black" />
+        ) : null}
       </div>
 
       <div className="p-5 pt-4">
@@ -220,11 +240,11 @@ export default function ClipCard({
             )}
 
             <div className="mb-2 flex flex-wrap items-center gap-1.5">
-              {clip.context_tags?.map((tag) => {
+              {clip.context_tags?.map((tag, ti) => {
                 const desc = describeTag(tag);
                 return (
                   <span
-                    key={tag}
+                    key={`${ti}-${tag}`}
                     title={desc || undefined}
                     className={`rounded border px-2 py-0.5 text-[10px] font-bold tracking-wide ${cat.bgColor} ${cat.borderColor} ${cat.color} ${desc ? "cursor-help" : ""}`}
                   >
@@ -259,10 +279,26 @@ export default function ClipCard({
             <div className="font-mono text-[10px] text-cs2-text-secondary">
               帧 {clip.start_tick.toLocaleString()} → {clip.end_tick.toLocaleString()}
             </div>
+
+            {isRoundMontage && typeof onFreezeToDeathDraftChange === "function" && (
+              <div
+                className="mt-2"
+                role="presentation"
+                onClick={(e) => e.stopPropagation()}
+                onKeyDown={(e) => e.stopPropagation()}
+              >
+                <RoundMontageRoundPicker
+                  maxRounds={matchTotalRounds}
+                  picked={ftdPicked}
+                  disabled={roundMontagePickerDisabled || inQueue}
+                  onChange={onFreezeToDeathDraftChange}
+                />
+              </div>
+            )}
           </div>
         </div>
 
-        {aiCommentary ? (
+        {showAiUi && aiCommentary ? (
           <div className="relative mt-4 min-w-0 overflow-hidden rounded-lg bg-zinc-950/75 pl-3.5 pr-3 py-2.5 shadow-[inset_0_1px_0_rgba(255,255,255,0.04)] ring-1 ring-white/[0.06]">
             <div
               className="pointer-events-none absolute bottom-1 left-0 top-1 w-[3px] rounded-full bg-gradient-to-b from-cs2-orange via-fuchsia-500/80 to-cyan-500/40 opacity-90"

@@ -6,18 +6,24 @@ import json
 import sys
 import traceback
 from pathlib import Path
+from typing import Any, Optional
 
 if __package__:
     from .demo_parser import DemoAnalyzer, get_demo_match_summary, get_player_list
+    from .radar.radar_data_extractor import extract_radar_timeline_impl
 else:
     backend_dir = Path(__file__).resolve().parents[1]
     if str(backend_dir) not in sys.path:
         sys.path.insert(0, str(backend_dir))
     from app.demo_parser import DemoAnalyzer, get_demo_match_summary, get_player_list
+    from app.radar.radar_data_extractor import extract_radar_timeline_impl
 
 
 def _run(payload: dict) -> object:
     action = str(payload.get("action") or "")
+    if action == "radar_timeline":
+        args = {k: v for k, v in payload.items() if k != "action"}
+        return extract_radar_timeline_impl(**args)
     dem_path = str(payload.get("dem_path") or "")
     if not dem_path:
         raise ValueError("dem_path is required")
@@ -25,7 +31,19 @@ def _run(payload: dict) -> object:
         target = str(payload.get("target_player") or "").strip()
         if not target:
             raise ValueError("target_player is required")
-        return DemoAnalyzer(dem_path).analyze(target).to_dict()
+        ftd_raw = payload.get("freeze_to_death_rounds")
+        ftd_list: Optional[list[int]] = None
+        if ftd_raw is not None:
+            if not isinstance(ftd_raw, list):
+                raise ValueError("freeze_to_death_rounds must be a list of integers or null")
+            out_ftd: list[int] = []
+            for x in ftd_raw:
+                try:
+                    out_ftd.append(int(x))
+                except (TypeError, ValueError) as e:
+                    raise ValueError(f"freeze_to_death_rounds must be integers: {x!r}") from e
+            ftd_list = out_ftd
+        return DemoAnalyzer(dem_path).analyze(target, freeze_to_death_rounds=ftd_list).to_dict()
     if action == "players":
         return get_player_list(dem_path)
     if action == "summary":

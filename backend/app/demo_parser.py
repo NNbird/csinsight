@@ -15,7 +15,7 @@ import uuid
 from bisect import bisect_left, bisect_right
 from dataclasses import dataclass, field, asdict, replace
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 import pandas as pd
 
@@ -72,6 +72,8 @@ class MatchMeta:
     target_deaths: int = 0
     team_a_score: int = 0  # 通常为 Team 2
     team_b_score: int = 0  # 通常为 Team 3
+    team_a_name: str = "Team A"
+    team_b_name: str = "Team B"
     match_date: str = ""  # 预留；当前 Demo 无可靠真实开赛时间，保持空串
     duration_mins: int = 0  # 回放时长（分钟），来自 header playback_time
     # o/i/z/211 系梗标签（与前端 PlayerSelect 一致）；非梗局为空列表
@@ -90,6 +92,8 @@ class Clip:
     kill_count: int
     start_tick: int
     end_tick: int
+    # 与 MatchMeta 同源，供 recorded_clips.clip_meta / 雷达使用（不从成片文件名推断）
+    map_name: str = "unknown"
     context_tags: list[str] = field(default_factory=list)
     # 玩家互动：下饭 = 谁杀了目标；高光 = 目标本回合多杀里杀了哪些人
     killer_name: Optional[str] = None
@@ -115,7 +119,16 @@ class Clip:
     # 导播剪辑按此列表逐个跳转，中间可插转场。非合集片段保持空列表。
     source_ticks: list[list[int]] = field(default_factory=list)
     source_rounds: list[int] = field(default_factory=list)
+    # 与 source_ticks 等长；freeze_to_death 每段 (start_round, end_round) 含端点，供前端按勾选子集入队切片
+    source_round_ends: list[int] = field(default_factory=list)
     compilation_kind: Optional[str] = None
+    # 为 True 时：导播与入队合并忽略智能分段 / 击杀前后预留等 pacing（仍保留 POV 开关类字段的显式覆写）
+    fixed_segment_pacing: bool = False
+    # 回合合集（compilation_kind=freeze_to_death）：本次解析使用的回合范围，写入结果 JSON 供库缓存/前端恢复。
+    # None = 使用全部合规非赛后回合；非空 list = 仅这些回合（与 source_ticks 同源）。
+    freeze_to_death_round_filter: Optional[list[int]] = None
+    # 每合规回合一条精确 [start_tick,end_tick]（与 source_ticks 合并段不同）；前端按勾选子集合并连续回合入队，无需重新解析。
+    freeze_to_death_round_windows: Optional[list[dict[str, Any]]] = None
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -125,12 +138,19 @@ class Clip:
 class ParseResult:
     match_meta: MatchMeta
     clips: list[Clip]
+    timeline: Optional[dict] = None
+    round_timeline: Optional[list] = None
 
     def to_dict(self) -> dict:
-        return {
+        out: dict = {
             "match_meta": asdict(self.match_meta),
             "clips": [c.to_dict() for c in self.clips],
         }
+        if self.timeline is not None:
+            out["timeline"] = self.timeline
+        if self.round_timeline is not None:
+            out["round_timeline"] = self.round_timeline
+        return out
 
 
 # ━━━ 武器中文翻译 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -248,6 +268,14 @@ def _highlight_weapon_used_label(kills_sorted: list[dict]) -> str:
 # ━━━ 武器分类 & 常量 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 TICK_RATE = 64
+# 「冻结结束前 → 死亡后固定留白」合辑：冻结结束 tick 之前开录的秒数（不受全局击杀前预留影响）
+_FREEZE_TO_DEATH_PRE_FREEZE_SEC = float(
+    os.environ.get("CS2_INSIGHT_FREEZE_TO_DEATH_PRE_SEC", "8.0") or "8.0",
+)
+# 死亡 tick 之后再录多少秒再切下一回合（固定 2s，不受全局结尾预留影响）
+_FREEZE_TO_DEATH_POST_DEATH_SEC = float(
+    os.environ.get("CS2_INSIGHT_FREEZE_TO_DEATH_POST_DEATH_SEC", "2.0") or "2.0",
+)
 BUFFER_SECONDS_BEFORE = 5
 BUFFER_SECONDS_AFTER = 3
 RAPID_KILL_WINDOW_SECONDS = 10
@@ -435,6 +463,20 @@ _BACKSTAB_SPRAY_WEAPONS = (
 )
 
 _EXTRA_EVENT_FIELDS = ["total_rounds_played"]
+# player_death 额外字段：回合时间线 Death Notice 徽章（未知键由解析库忽略）
+_PLAYER_DEATH_GAME_KEYS = [
+    "headshot",
+    "noscope",
+    "thrusmoke",
+    "attackerblind",
+    "penetrated",
+    "assistedflash",
+    "attackerinair",
+    "attacker_in_air",
+    "inair",
+    "through_smoke",
+    "penetrated_objects",
+]
 
 
 # ━━━ 工具函数 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -603,15 +645,15 @@ class DemoAnalyzer:
         except Exception:
             return "unknown"
 
-    def _build_match_summary(self, match_start_tick: int) -> tuple[int, int, str, int]:
+    def _build_match_summary(self, match_start_tick: int) -> tuple[int, int, str, int, str, str]:
         """
-        全局比赛信息：Team2/Team3 最终比分、Demo 文件修改时间、回放时长（分钟）。
+        全局比赛信息：Team2/Team3 最终比分、Demo 文件修改时间、回放时长（分钟）、队名。
         比分来自 round_end.winner（CT/T 或 2/3）；时长来自 parse_header().playback_time（秒）。
         """
-        ta, tb, md, dm, _ = collect_match_summary_metrics(
+        ta, tb, md, dm, _, tan, tbn = collect_match_summary_metrics(
             self.parser, self.dem_path, match_start_tick,
         )
-        return ta, tb, md, dm
+        return ta, tb, md, dm, tan, tbn
 
     def _safe_parse_event(
         self, event_name: str, other: Optional[list[str]] = None,
@@ -918,11 +960,15 @@ class DemoAnalyzer:
             w = _round_end_winner_team_num(row.get(winner_col))
             if w is None:
                 continue
+            # 与 ``_build_round_scores_team_based`` / ``round_end`` 注释一致：
+            # ``total_rounds_played`` 在本事件上已是「刚结束的回合编号」（1-based），勿再 +1。
             if trc is not None:
-                ended_round = _int(row.get(trc)) + 1
+                ended_round = _int(row.get(trc))
             else:
                 seq += 1
                 ended_round = seq
+            if ended_round <= 0:
+                continue
             out[ended_round] = {2: scores[2], 3: scores[3]}
             scores[w] = scores.get(w, 0) + 1
             out[ended_round + 1] = {2: scores[2], 3: scores[3]}
@@ -1002,7 +1048,12 @@ class DemoAnalyzer:
     # ────────────────────────────────────────────────────────────
     #  主分析入口
     # ────────────────────────────────────────────────────────────
-    def analyze(self, target_player: str) -> ParseResult:
+    def analyze(
+        self,
+        target_player: str,
+        *,
+        freeze_to_death_rounds: Optional[list[int]] = None,
+    ) -> ParseResult:
         map_name = self._detect_map()
 
         match_start_tick = _get_match_start_tick(self.parser)
@@ -1030,7 +1081,8 @@ class DemoAnalyzer:
         defused_df = self._safe_parse_event("bomb_defused")
 
         # ── 解析所有需要的事件表 ──
-        events = self.parser.parse_event("player_death", other=_EXTRA_EVENT_FIELDS)
+        _death_other = list(dict.fromkeys(list(_EXTRA_EVENT_FIELDS) + list(_PLAYER_DEATH_GAME_KEYS)))
+        events = self.parser.parse_event("player_death", other=_death_other)
         equip_df = self._safe_parse_event("item_equip")
         fire_df = self._safe_parse_event("weapon_fire")
         hurt_df = self._safe_parse_event("player_hurt")
@@ -1551,6 +1603,7 @@ class DemoAnalyzer:
             round_team_score_map,
             round_result_map,
             round_freeze_end_ticks,
+            map_name=map_name,
             flash_on_target_index=flash_on_target_index,
             grenade_detonate_points=grenade_detonate_points,
         )
@@ -1652,6 +1705,7 @@ class DemoAnalyzer:
 
             highlight_clips.append(Clip(
                 clip_id=f"c_{uuid.uuid4().hex[:8]}",
+                map_name=map_name,
                 round=rnd,
                 category="highlight",
                 weapon_used=_highlight_weapon_used_label(kills_sorted),
@@ -1683,6 +1737,7 @@ class DemoAnalyzer:
                 )
                 highlight_clips.append(Clip(
                     clip_id=f"c_{uuid.uuid4().hex[:8]}",
+                    map_name=map_name,
                     round=rnd,
                     category="highlight",
                     weapon_used=_translate_weapon(wpn),
@@ -1709,6 +1764,7 @@ class DemoAnalyzer:
             )
             highlight_clips.append(Clip(
                 clip_id=f"c_{uuid.uuid4().hex[:8]}",
+                map_name=map_name,
                 round=rnd,
                 category="highlight",
                 weapon_used=_translate_weapon(wpn),
@@ -1757,6 +1813,7 @@ class DemoAnalyzer:
                 _end = kt + BUFFER_SECONDS_AFTER * TICK_RATE
                 highlight_clips.append(Clip(
                     clip_id=f"c_{uuid.uuid4().hex[:8]}",
+                    map_name=map_name,
                     round=rnd,
                     category="highlight",
                     weapon_used=_translate_weapon(wpn),
@@ -1807,6 +1864,7 @@ class DemoAnalyzer:
                 _end = kt + BUFFER_SECONDS_AFTER * TICK_RATE
                 highlight_clips.append(Clip(
                     clip_id=f"c_{uuid.uuid4().hex[:8]}",
+                    map_name=map_name,
                     round=rnd,
                     category="highlight",
                     weapon_used=_translate_weapon(_kq_w),
@@ -1861,6 +1919,7 @@ class DemoAnalyzer:
             )
             merged_highlights.append(Clip(
                 clip_id=f"c_{uuid.uuid4().hex[:8]}",
+                map_name=map_name,
                 round=bh["round"],
                 category="highlight",
                 weapon_used=_translate_weapon("defuse_kit"),
@@ -1889,8 +1948,12 @@ class DemoAnalyzer:
             round_result_map=round_result_map,
             round_team_score_map=round_team_score_map,
             round_death_tick_map=round_death_tick_map,
+            map_name=map_name,
         )
         fail_clips = fail_clips + shoulder_clips
+
+        _re_df_for_demo_max = self._safe_parse_event("round_end", other=["total_rounds_played"])
+        _demo_max_tick = _max_demo_tick(self.parser, _re_df_for_demo_max, match_start_tick)
 
         # ── 跨回合合集片段（🥩 亲儿子喂饭 / ☠️ 本命苦主）──
         compilation_clips = self._build_rival_compilations(
@@ -1900,6 +1963,9 @@ class DemoAnalyzer:
             round_team_score_map,
             round_result_map,
             round_freeze_end_ticks,
+            freeze_to_death_rounds=freeze_to_death_rounds,
+            map_name=map_name,
+            demo_max_tick=_demo_max_tick,
         )
 
         clips = fail_clips + highlight_clips + meme_clips + compilation_clips
@@ -2001,7 +2067,13 @@ class DemoAnalyzer:
             if _c.clip_max_tick is not None:
                 pass  # 已由外部设置，跳过
             elif _c.category == "compilation":
-                pass
+                _ck = str(getattr(_c, "compilation_kind", None) or "").strip()
+                if _ck == "freeze_to_death":
+                    _ld = getattr(_c, "death_tick", None)
+                    if _ld is not None and int(_ld) > 0:
+                        _c.clip_max_tick = int(_ld) + _last_kill_buf_ticks
+                        if _c.end_tick > _c.clip_max_tick:
+                            _c.end_tick = _c.clip_max_tick
             elif _c.round == _last_rnd_num:
                 # 最后一回合：以该 clip 自身的最后击杀/死亡 tick 为基准
                 if _c.kill_ticks:
@@ -2052,8 +2124,8 @@ class DemoAnalyzer:
                 _c.round == _last_rnd_num,
             )
 
-        team_a_score, team_b_score, match_date, duration_mins = self._build_match_summary(
-            match_start_tick,
+        team_a_score, team_b_score, match_date, duration_mins, team_a_name, team_b_name = (
+            self._build_match_summary(match_start_tick)
         )
 
         name_to_uid = build_player_name_to_user_id(self.parser, match_start_tick)
@@ -2083,6 +2155,61 @@ class DemoAnalyzer:
         if rounds_by_wins > 0:
             total_rounds = rounds_by_wins
 
+        timeline: Optional[dict] = None
+        round_timeline: Optional[list] = None
+        try:
+            from .round_timeline import build_round_timeline, build_round_timeline_error_fallback
+
+            round_scores_tbl = self._build_round_scores(match_start_tick)
+            re_df_tl = self._safe_parse_event("round_end", other=list(_EXTRA_EVENT_FIELDS))
+            if match_start_tick > 0 and not re_df_tl.empty and "tick" in re_df_tl.columns:
+                re_df_tl = re_df_tl.loc[
+                    pd.to_numeric(re_df_tl["tick"], errors="coerce").fillna(0).astype(int) >= match_start_tick
+                ]
+            tteam: Optional[int] = None
+            if round_target_team_map:
+                for rk in (1, *sorted(round_target_team_map.keys())):
+                    if rk in round_target_team_map:
+                        tteam = int(round_target_team_map[rk])
+                        break
+            bundle = build_round_timeline(
+                demo_path=str(self.dem_path),
+                map_name=map_name,
+                target_player=target_player,
+                target_player_user_id=target_player_user_id,
+                target_steam_id=target_steam_id,
+                target_team_num=tteam,
+                round_target_team_map=round_target_team_map or {},
+                events=events,
+                round_freeze_end_ticks=round_freeze_end_ticks,
+                round_result_map=round_result_map,
+                round_scores_by_round=round_scores_tbl,
+                round_end_df=re_df_tl,
+                round_end_tick_map=_round_end_evt_tick_map,
+                clips=[c.to_dict() for c in clips],
+                total_rounds=total_rounds,
+                match_start_tick=match_start_tick,
+                tick_rate=float(TICK_RATE),
+            )
+            timeline = bundle.get("timeline")
+            round_timeline = bundle.get("round_timeline")
+        except BaseException as e:
+            if isinstance(e, _DEMOPARSER_RE_RAISE):
+                raise
+            logger.exception("build_round_timeline failed for %s", self.dem_path)
+            from .round_timeline import build_round_timeline_error_fallback
+
+            fb = build_round_timeline_error_fallback(
+                demo_path=str(self.dem_path),
+                map_name=map_name,
+                target_player=target_player,
+                target_steam_id=target_steam_id,
+                target_player_user_id=target_player_user_id,
+                total_rounds=total_rounds,
+            )
+            timeline = fb["timeline"]
+            round_timeline = fb["round_timeline"]
+
         return ParseResult(
             match_meta=MatchMeta(
                 map_name=map_name,
@@ -2094,11 +2221,15 @@ class DemoAnalyzer:
                 target_deaths=target_total_deaths,
                 team_a_score=team_a_score,
                 team_b_score=team_b_score,
+                team_a_name=team_a_name,
+                team_b_name=team_b_name,
                 match_date=match_date,
                 duration_mins=duration_mins,
                 meme_series_badges=meme_series_badges_for_kd(target_total_kills, target_total_deaths),
             ),
             clips=clips,
+            timeline=timeline,
+            round_timeline=round_timeline,
         )
 
     # ────────────────────────────────────────────────────────────
@@ -2113,6 +2244,7 @@ class DemoAnalyzer:
         round_result_map: "dict[int, bool | None]",
         round_team_score_map: dict,
         round_death_tick_map: dict[int, int],
+        map_name: str,
     ) -> "list[Clip]":
         """
         检测「我与敌人肩并肩」场景：目标玩家与敌方玩家在某一段时间内持续近距离
@@ -2238,6 +2370,7 @@ class DemoAnalyzer:
 
             clips.append(Clip(
                 clip_id=f"c_{uuid.uuid4().hex[:8]}",
+                map_name=map_name,
                 round=rnd,
                 category="fail",
                 weapon_used="",
@@ -2267,6 +2400,10 @@ class DemoAnalyzer:
         round_team_score_map: dict[int, tuple[int, int]],
         round_result_map: dict[int, bool],
         round_freeze_end_ticks: dict[int, int],
+        *,
+        freeze_to_death_rounds: Optional[list[int]] = None,
+        map_name: str,
+        demo_max_tick: int = 0,
     ) -> list[Clip]:
         """合集片段：
         - 🥩 亲儿子喂饭：本局击杀同一敌人 ≥ 8 次 → 把所有对该敌人的击杀拼为合集 clip
@@ -2364,6 +2501,7 @@ class DemoAnalyzer:
             _last_rnd, last_t = items[-1]
             compilations.append(Clip(
                 clip_id=f"c_{uuid.uuid4().hex[:8]}",
+                map_name=map_name,
                 round=first_rnd,
                 category="compilation",
                 weapon_used="",
@@ -2415,6 +2553,7 @@ class DemoAnalyzer:
             _last_rnd, last_t = items[-1]
             compilations.append(Clip(
                 clip_id=f"c_{uuid.uuid4().hex[:8]}",
+                map_name=map_name,
                 round=first_rnd,
                 category="compilation",
                 weapon_used="",
@@ -2443,6 +2582,7 @@ class DemoAnalyzer:
             victims = [victim for _, _, victim in all_target_kills]
             compilations.append(Clip(
                 clip_id=f"c_{uuid.uuid4().hex[:8]}",
+                map_name=map_name,
                 round=first_rnd,
                 category="compilation",
                 weapon_used="",
@@ -2470,6 +2610,7 @@ class DemoAnalyzer:
             killers = [attacker for _, _, attacker in all_target_deaths]
             compilations.append(Clip(
                 clip_id=f"c_{uuid.uuid4().hex[:8]}",
+                map_name=map_name,
                 round=first_rnd,
                 category="compilation",
                 weapon_used="",
@@ -2487,6 +2628,198 @@ class DemoAnalyzer:
                 source_rounds=[rn for rn, _, _ in all_target_deaths],
                 compilation_kind="all_deaths",
             ))
+
+        # —— 🎥 冻结结束前 → 死亡（固定 2s 后切下一段）——
+        # 连续多回合无死亡时合并为**一段**连续录制（无跳切）；遇死亡回合则录至死后 2s 再跳切。
+        # 不受 BUFFER / 击杀预留 / 智能分段 pacing 影响；区间写入 source_ticks。
+        if freeze_to_death_rounds is not None and len(freeze_to_death_rounds) == 0:
+            pass
+        else:
+            _ftd_demo_mx = max(0, int(demo_max_tick or 0))
+
+            ftd_filter: Optional[set[int]] = None
+            if freeze_to_death_rounds is not None:
+                ftd_filter = {int(x) for x in freeze_to_death_rounds if int(x) > 0}
+            death_tick_by_round: dict[int, int] = {}
+            for d in death_records:
+                rn = _int(d.get("round"))
+                dt = _int(d.get("tick"))
+                if rn <= 0 or dt <= 0:
+                    continue
+                prev = death_tick_by_round.get(rn)
+                if prev is None or dt < prev:
+                    death_tick_by_round[rn] = dt
+
+            pre_ticks = max(1, int(abs(_FREEZE_TO_DEATH_PRE_FREEZE_SEC) * TICK_RATE))
+            post_ticks = max(1, int(abs(_FREEZE_TO_DEATH_POST_DEATH_SEC) * TICK_RATE))
+
+            def _ftd_cap_at_death_round(rnd: int, death_tick: int) -> int:
+                fe = int(round_freeze_end_ticks.get(rnd) or 0)
+                raw_end = int(death_tick) + post_ticks
+                next_fe = round_freeze_end_ticks.get(rnd + 1)
+                if next_fe and next_fe > fe:
+                    return min(raw_end, int(next_fe) - int(5 * TICK_RATE))
+                return raw_end
+
+            def _ftd_safe_end_alive_round(rnd: int) -> int:
+                """本回合无死亡时：录到下一回合 freeze 前若干 tick（与既有 demo 安全策略一致）。"""
+                next_fe = round_freeze_end_ticks.get(rnd + 1)
+                if next_fe:
+                    return max(int(next_fe) - int(5 * TICK_RATE), 0)
+                fe = int(round_freeze_end_ticks.get(rnd) or 0)
+                return fe + int(150 * TICK_RATE) if fe > 0 else int(150 * TICK_RATE)
+
+            eligible: list[int] = []
+            for rnd in sorted(round_freeze_end_ticks.keys()):
+                if ftd_filter is not None and rnd not in ftd_filter:
+                    continue
+                if DemoAnalyzer._is_post_match_round(
+                    rnd,
+                    *DemoAnalyzer._round_start_scores_for_target(rnd, round_team_score_map),
+                    completed_rounds=_done_rounds,
+                    final_scoreline=_final_line,
+                ):
+                    continue
+                fe = int(round_freeze_end_ticks.get(rnd) or 0)
+                if fe <= 0:
+                    continue
+                eligible.append(rnd)
+
+            ftd_round_windows: list[dict[str, Any]] = []
+            for rnd in eligible:
+                fe = int(round_freeze_end_ticks.get(rnd) or 0)
+                if fe <= 0:
+                    continue
+                dt = death_tick_by_round.get(rnd)
+                s = max(0, fe - pre_ticks)
+                if dt is not None and int(dt) > 0:
+                    _dtk = int(dt)
+                    raw_end = _dtk + post_ticks
+                    cap_e = _ftd_cap_at_death_round(rnd, _dtk)
+                    e = max(s + 1, min(raw_end, cap_e))
+                else:
+                    e = max(s + 1, _ftd_safe_end_alive_round(rnd))
+                if _ftd_demo_mx > 0:
+                    e = max(s + 1, min(e, _ftd_demo_mx))
+                ftd_round_windows.append(
+                    {
+                        "round": int(rnd),
+                        "freeze_end_tick": int(fe),
+                        "start_tick": int(s),
+                        "end_tick": int(e),
+                        "death_tick": int(dt)
+                        if dt is not None and int(dt) > 0
+                        else None,
+                    }
+                )
+
+            # (seg_start, seg_end, first_round, last_round, death_tick|None)
+            ftd_segments: list[tuple[int, int, int, int, Optional[int]]] = []
+            run_start_r: Optional[int] = None
+            run_start_tick: int = 0
+            last_r: Optional[int] = None
+
+            def _emit_death_segment(sr: int, s_tick: int, er: int, d_tick: int) -> None:
+                raw_end = int(d_tick) + post_ticks
+                cap_e = _ftd_cap_at_death_round(er, d_tick)
+                seg_end = max(s_tick + 1, min(raw_end, cap_e))
+                if _ftd_demo_mx > 0:
+                    seg_end = max(s_tick + 1, min(seg_end, _ftd_demo_mx))
+                if seg_end <= s_tick:
+                    return
+                ftd_segments.append((s_tick, seg_end, sr, er, d_tick))
+
+            def _emit_alive_segment(sr: int, s_tick: int, er: int) -> None:
+                cap_e = _ftd_safe_end_alive_round(er)
+                if _ftd_demo_mx > 0:
+                    cap_e = min(cap_e, _ftd_demo_mx)
+                if cap_e <= s_tick:
+                    return
+                ftd_segments.append((s_tick, cap_e, sr, er, None))
+
+            def _flush_open_run() -> None:
+                nonlocal run_start_r, run_start_tick, last_r
+                if run_start_r is None or last_r is None:
+                    return
+                _emit_alive_segment(run_start_r, run_start_tick, last_r)
+                run_start_r = None
+                last_r = None
+
+            for rnd in eligible:
+                fe = int(round_freeze_end_ticks.get(rnd) or 0)
+                if fe <= 0:
+                    continue
+                dt = death_tick_by_round.get(rnd)
+
+                if run_start_r is None:
+                    run_start_r = rnd
+                    run_start_tick = max(0, fe - pre_ticks)
+                    last_r = rnd
+                    if dt is not None and dt > 0:
+                        _emit_death_segment(run_start_r, run_start_tick, rnd, dt)
+                        run_start_r = None
+                        last_r = None
+                    continue
+
+                if rnd != last_r + 1:
+                    _flush_open_run()
+                    run_start_r = rnd
+                    run_start_tick = max(0, fe - pre_ticks)
+                    last_r = rnd
+                    if dt is not None and dt > 0:
+                        _emit_death_segment(run_start_r, run_start_tick, rnd, dt)
+                        run_start_r = None
+                        last_r = None
+                    continue
+
+                last_r = rnd
+                if dt is not None and dt > 0:
+                    _emit_death_segment(run_start_r, run_start_tick, rnd, dt)
+                    run_start_r = None
+                    last_r = None
+
+            _flush_open_run()
+
+            if ftd_segments:
+                source_ticks = [[s, e] for (s, e, _sr, _er, _d) in ftd_segments]
+                first_rnd = ftd_segments[0][2]
+                kill_anchors: list[int] = []
+                for (_s, e, _sr, _er, dtk) in ftd_segments:
+                    if dtk is not None and dtk > 0:
+                        kill_anchors.append(int(dtk))
+                    else:
+                        kill_anchors.append(max(_s, e - 1))
+                last_death = next((d for (_s, _e, _sr, _er, d) in reversed(ftd_segments) if d is not None), None)
+                ftd_round_filter_out: Optional[list[int]] = None
+                if ftd_filter is not None:
+                    ftd_round_filter_out = sorted(ftd_filter)
+                compilations.append(Clip(
+                    clip_id=f"c_{uuid.uuid4().hex[:8]}",
+                    map_name=map_name,
+                    round=first_rnd,
+                    category="compilation",
+                    weapon_used="",
+                    kill_count=0,
+                    start_tick=source_ticks[0][0],
+                    end_tick=source_ticks[-1][1],
+                    context_tags=[
+                        "🎬 回合合集"
+                    ],
+                    killer_name=None,
+                    killers=[],
+                    victims=[],
+                    kill_ticks=kill_anchors,
+                    round_won=round_result_map.get(first_rnd),
+                    clip_min_tick=round_freeze_end_ticks.get(first_rnd),
+                    death_tick=last_death,
+                    source_ticks=source_ticks,
+                    source_rounds=[sr for (_s, _e, sr, _er, _d) in ftd_segments],
+                    source_round_ends=[_er for (_s, _e, sr, _er, _d) in ftd_segments],
+                    compilation_kind="freeze_to_death",
+                    fixed_segment_pacing=True,
+                    freeze_to_death_round_filter=ftd_round_filter_out,
+                    freeze_to_death_round_windows=ftd_round_windows,
+                ))
 
         return compilations
 
@@ -2506,6 +2839,7 @@ class DemoAnalyzer:
         round_result_map: dict[int, bool],
         round_freeze_end_ticks: dict[int, int],
         *,
+        map_name: str,
         flash_on_target_index: Optional[list[tuple[int, float]]] = None,
         grenade_detonate_points: Optional[list[tuple[int, float, float]]] = None,
     ) -> tuple[list[Clip], set[tuple[int, int]]]:
@@ -2544,6 +2878,7 @@ class DemoAnalyzer:
                     score_opp=se,
                     round_won=round_result_map.get(death["round"]),
                     clip_min_tick=round_freeze_end_ticks.get(death["round"]),
+                    map_name=map_name,
                 ))
                 fail_death_keys.add((death["round"], death["tick"]))
                 continue
@@ -2610,6 +2945,7 @@ class DemoAnalyzer:
                     score_opp=se,
                     round_won=round_result_map.get(death["round"]),
                     clip_min_tick=round_freeze_end_ticks.get(death["round"]),
+                    map_name=map_name,
                 ))
                 fail_death_keys.add((death["round"], death["tick"]))
 
@@ -4287,6 +4623,7 @@ class DemoAnalyzer:
         score_opp: Optional[int] = None,
         round_won: Optional[bool] = None,
         clip_min_tick: Optional[int] = None,
+        map_name: str = "unknown",
     ) -> Clip:
         if death_core:
             start = max(0, tick - int(TICK_RATE * float(_DEATH_CLIP_LEAD_SECONDS)))
@@ -4295,6 +4632,7 @@ class DemoAnalyzer:
         end = end_tick_override if end_tick_override else tick + BUFFER_SECONDS_AFTER * TICK_RATE
         return Clip(
             clip_id=f"c_{uuid.uuid4().hex[:8]}",
+            map_name=map_name,
             round=round_num,
             category=category,
             weapon_used=_translate_weapon(weapon),
@@ -4617,16 +4955,58 @@ def _scoreline_by_starting_roster(
     return wins_start2, wins_start3
 
 
+def _extract_team_names_from_demo(parser: DemoParser, tick: int) -> tuple[Optional[str], Optional[str]]:
+    """从 Demo 内部实体属性提取队伍名称（CCSTeam.m_szClanTeamname）。"""
+    try:
+        t = max(1, tick)
+        df = _to_pandas_df(
+            parser.parse_ticks(
+                ["CCSTeam.m_szClanTeamname", "CCSTeam.m_iTeamNum"],
+                ticks=[t],
+            )
+        )
+        if df.empty:
+            return None, None
+
+        t2_name: Optional[str] = None
+        t3_name: Optional[str] = None
+        col_name = "CCSTeam.m_szClanTeamname"
+        col_num = "CCSTeam.m_iTeamNum"
+
+        if col_name not in df.columns or col_num not in df.columns:
+            return None, None
+
+        for _, row in df.iterrows():
+            tn = _cell_team(row.get(col_num))
+            name = _cell_str(row.get(col_name))
+            if not name or name.lower() in ("ct", "terrorist", "t"):
+                continue
+            if tn == 2:
+                t2_name = name
+            elif tn == 3:
+                t3_name = name
+            if t2_name and t3_name:
+                break
+        return t2_name, t3_name
+    except Exception:
+        return None, None
+
+
 def collect_match_summary_metrics(
     parser: DemoParser,
     dem_path: Path,
     match_start_tick: int,
-) -> tuple[int, int, str, int, int]:
+) -> tuple[int, int, str, int, int, str, str]:
     """
-    全局比赛信息：开赛时 Team2 / Team3 阵容各自胜场、Demo 文件时间、时长（分钟）、总回合。
+    全局比赛信息：开赛时 Team2 / Team3 阵容各自胜场、Demo 文件时间、时长（分钟）、总回合、队伍名称。
     """
     team_a_score = 0
     team_b_score = 0
+
+    internal_a, internal_b = _extract_team_names_from_demo(parser, match_start_tick)
+    team_a_name = internal_a or "Team A"
+    team_b_name = internal_b or "Team B"
+
     # Demo 内无可靠真实开赛时间，不向客户端展示误导性的文件时间
     match_date = ""
     duration_mins = 0
@@ -4650,7 +5030,15 @@ def collect_match_summary_metrics(
         re_df = pd.DataFrame()
 
     if re_df.empty:
-        return team_a_score, team_b_score, match_date, duration_mins, total_rounds_est
+        return (
+            team_a_score,
+            team_b_score,
+            match_date,
+            duration_mins,
+            total_rounds_est,
+            team_a_name,
+            team_b_name,
+        )
 
     re_filtered = re_df
     if match_start_tick > 0 and "tick" in re_df.columns:
@@ -4677,7 +5065,15 @@ def collect_match_summary_metrics(
     duration_ticks = _duration_mins_from_tick_span(match_start_tick, max_tick)
     duration_mins = max(duration_header, duration_ticks)
 
-    return team_a_score, team_b_score, match_date, duration_mins, total_rounds_est
+    return (
+        team_a_score,
+        team_b_score,
+        match_date,
+        duration_mins,
+        total_rounds_est,
+        team_a_name,
+        team_b_name,
+    )
 
 
 def get_demo_match_summary(dem_path: str | Path) -> dict[str, object]:
@@ -4688,6 +5084,7 @@ def get_demo_match_summary(dem_path: str | Path) -> dict[str, object]:
     path = Path(dem_path)
     fallback: dict[str, object] = {
         "map_name": "unknown",
+        "server_name": "",
         "target_player": "",
         "target_player_user_id": None,
         "target_steam_id": None,
@@ -4696,21 +5093,28 @@ def get_demo_match_summary(dem_path: str | Path) -> dict[str, object]:
         "target_deaths": 0,
         "team_a_score": 0,
         "team_b_score": 0,
+        "team_a_name": "Team A",
+        "team_b_name": "Team B",
         "match_date": "",
         "duration_mins": 0,
     }
     try:
         parser = DemoParser(str(path))
         mst = _get_match_start_tick(parser)
-        ta, tb, md, dm, tr_est = collect_match_summary_metrics(parser, path, mst)
+        ta, tb, md, dm, tr_est, tan, tbn = collect_match_summary_metrics(parser, path, mst)
         try:
-            mn = parser.parse_header().get("map_name", "unknown") or "unknown"
+            hdr = parser.parse_header()
+            mn = hdr.get("map_name", "unknown") or "unknown"
+            sn_raw = hdr.get("server_name")
+            sn = str(sn_raw).strip() if sn_raw is not None else ""
         except BaseException as e:
             if isinstance(e, (KeyboardInterrupt, SystemExit, GeneratorExit)):
                 raise
             mn = "unknown"
+            sn = ""
         return {
             "map_name": mn,
+            "server_name": sn,
             "target_player": "",
             "target_player_user_id": None,
             "target_steam_id": None,
@@ -4719,6 +5123,8 @@ def get_demo_match_summary(dem_path: str | Path) -> dict[str, object]:
             "target_deaths": 0,
             "team_a_score": int(ta),
             "team_b_score": int(tb),
+            "team_a_name": tan,
+            "team_b_name": tbn,
             "match_date": md,
             "duration_mins": int(dm),
         }

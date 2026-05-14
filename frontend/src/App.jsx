@@ -1,204 +1,46 @@
 import { useState, useCallback, useMemo, useEffect, useRef } from "react";
 import axios from "axios";
-import Sidebar from "./components/Sidebar";
-import DemoUpload from "./components/DemoUpload";
-import PlayerSelect from "./components/PlayerSelect";
-import MatchScoreboard from "./components/MatchScoreboard";
-import ClipList from "./components/ClipList";
-import ActionBar from "./components/ActionBar";
+import { Routes, Route, Navigate, useNavigate, useLocation } from "react-router-dom";
+import { AppShellProvider } from "./context/AppShellContext";
+import SidebarNav from "./components/SidebarNav";
+import RecordingBlockedDialog from "./components/RecordingBlockedDialog";
 import RecordWarmupModal from "./components/RecordWarmupModal";
 import ProgressBar from "./components/ProgressBar";
-import MatchSwitcher from "./components/MatchSwitcher";
 import LibraryLoadModeModal from "./components/LibraryLoadModeModal";
-import RecordingQueueDrawer from "./components/RecordingQueueDrawer";
-import CommonParamsModal from "./components/CommonParamsModal";
-import { useRecordingQueue, stripGlobalPacingMetaKeys } from "./stores/recordingQueueStore";
-import { ensureClientClipUidsOnClips, stripClientClipUid } from "./utils/clipClientUid";
-import { warmupApiPayloadToPersisted } from "./utils/warmupDefaults";
+import GuidePage from "./pages/GuidePage";
+import DemoLibraryPage from "./pages/DemoLibraryPage";
+import AnalysisPage from "./pages/AnalysisPage";
+import RecordingQueuePage from "./pages/RecordingQueuePage";
+import MontageWorkbenchPage from "./pages/MontageWorkbenchPage";
+import CommonParamsPage from "./pages/CommonParamsPage";
+import ObsConfigCenterPage from "./pages/ObsConfigCenterPage";
+import SettingsPage from "./pages/SettingsPage";
+import PlayerGameConfigPage from "./pages/PlayerGameConfigPage";
+import { useRecordingQueue } from "./stores/recordingQueueStore";
+import { ensureClientClipUidsOnClips } from "./utils/clipClientUid";
 import {
-  Package,
-  RefreshCw,
-  Loader2,
-  FolderSync,
-  Trash2,
-  RotateCw,
-  ChevronLeft,
-  ChevronRight,
-  Pencil,
-  Search,
-  ShieldAlert,
-  SlidersHorizontal,
-  X,
-} from "lucide-react";
+  freezeToDeathDraftFromClipFilter,
+  isFreezeToDeathCompilation,
+  sliceFreezeToDeathClipForEnqueue,
+} from "./utils/freezeToDeathRoundFilter";
+import { warmupApiPayloadToPersisted } from "./utils/warmupDefaults";
+import { buildTimelineEventClipData, buildTimelineRoundClipData } from "./utils/timelineQueue";
+import { queueItemClientUid, runWithConcurrency, buildBatchGroupsFromQueue } from "./utils/recordingBatch";
+import { formatRecordingApiError } from "./utils/formatRecordingApiError";
+import { Loader2 } from "lucide-react";
 
 const API = axios.create({ baseURL: "/api" });
 
-/**
- * 推断对话框副标题：根据后端返回的 detail 文本判定具体阻断场景。
- * 与原 "CS2 正在运行" 路径共用同一个对话框组件，保持视觉风格统一。
- */
-function recordingBlockedSubtitle(message) {
-  const m = String(message || "");
-  if (
-    m.includes("分辨率") ||
-    m.includes("屏幕比例") ||
-    m.includes("宽高") ||
-    m.includes("启动分辨率") ||
-    m.includes("所选屏幕比例") ||
-    m.includes("填写启动分辨率")
-  ) {
-    return "录制预热选项未通过校验";
-  }
-  if (m.includes("GSI") || m.includes("未就绪") || m.includes("未进入游戏")) {
-    return "CS2 未在限定时间内进入游戏画面";
-  }
-  if (m.includes("正在运行") || m.includes("CS2") && m.includes("退出")) {
-    return "当前检测到 CS2 正在运行";
-  }
-  if (m.includes("已有录制任务")) {
-    return "已有录制任务进行中";
-  }
-  return "录制启动条件未满足";
-}
-
-/** 提取 FastAPI / axios 报错文案（含 422 校验数组）。 */
-function formatRecordingApiError(e) {
-  const data = e?.response?.data;
-  const d = data?.detail;
-  if (typeof d === "string") return d;
-  if (Array.isArray(d)) {
-    return d
-      .map((item) => {
-        if (item && typeof item === "object" && item.msg != null) return String(item.msg);
-        try {
-          return JSON.stringify(item);
-        } catch {
-          return String(item);
-        }
-      })
-      .join(" ");
-  }
-  if (d != null && typeof d === "object") {
-    try {
-      return JSON.stringify(d);
-    } catch {
-      /* fallthrough */
-    }
-  }
-  return String(e?.message || "请求失败");
-}
-
-function RecordingBlockedDialog({ message, onClose }) {
-  if (!message) return null;
-  const subtitle = recordingBlockedSubtitle(message);
-  return (
-    <div
-      className="fixed inset-0 z-[120] flex items-center justify-center bg-black/70 px-4 py-6 backdrop-blur-sm"
-      role="dialog"
-      aria-modal="true"
-      aria-labelledby="recording-blocked-title"
-      onClick={(e) => {
-        if (e.target === e.currentTarget) onClose();
-      }}
-    >
-      <div className="relative w-full max-w-md overflow-hidden rounded-xl border border-white/10 bg-cs2-bg-card shadow-2xl">
-        <button
-          type="button"
-          onClick={onClose}
-          className="absolute right-3 top-3 rounded-md p-1.5 text-zinc-500 hover:bg-white/[0.06] hover:text-zinc-300"
-          aria-label="关闭"
-        >
-          <X className="h-4 w-4" />
-        </button>
-
-        <div className="flex items-start gap-3 border-b border-white/10 px-5 py-4">
-          <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg border border-cs2-orange/30 bg-cs2-orange/10 text-cs2-orange">
-            <ShieldAlert className="h-5 w-5" />
-          </div>
-          <div className="min-w-0 pr-7">
-            <h2 id="recording-blocked-title" className="text-sm font-bold text-white">
-              无法开始录制
-            </h2>
-            <p className="mt-1 text-[11px] leading-relaxed text-zinc-500">{subtitle}</p>
-          </div>
-        </div>
-
-        <div className="px-5 py-4">
-          <p className="text-sm leading-6 text-zinc-300 whitespace-pre-wrap break-words">{message}</p>
-        </div>
-
-        <div className="flex justify-end border-t border-white/10 bg-black/20 px-5 py-3">
-          <button
-            type="button"
-            onClick={onClose}
-            className="rounded-lg bg-cs2-orange px-4 py-2 text-sm font-extrabold text-black shadow-lg shadow-cs2-orange/20 transition-colors hover:bg-cs2-orange-light"
-          >
-            知道了
-          </button>
-        </div>
-      </div>
-    </div>
-  );
-}
-
-function queueItemClientUid(it) {
-  return it.clientClipUid || `legacy:${it.demoFilename}:${it.clipId}`;
-}
-
-/** @param {number} limit @param {T[]} items @param {(item: T) => Promise<void>} work @template T */
-async function runWithConcurrency(limit, items, work) {
-  if (!items.length) return;
-  const n = Math.min(Math.max(1, limit), items.length);
-  let cursor = 0;
-  const worker = async () => {
-    while (true) {
-      const my = cursor++;
-      if (my >= items.length) break;
-      await work(items[my]);
-    }
-  };
-  await Promise.all(Array.from({ length: n }, () => worker()));
-}
-
-/**
- * 构建批量录制 groups 数组。
- * @param {import("./stores/recordingQueueStore").RecordingQueueItem[]} queue
- * @param {import("./stores/recordingQueueStore").PacingOverride} globalPacing
- *   全局节奏参数，作为所有片段的基底；片段自身的 pacing_override 优先级更高（覆盖同名字段）。
- */
-function buildBatchGroupsFromQueue(queue, globalPacing = {}) {
-  // 分组键 = demo文件名 + 玩家名，同一个 demo 的不同玩家各自独立成一个 group，
-  // 这样后端才能在同一 CS2 会话内按玩家切换 spec_player。
-  const byDemoPlayer = new Map();
-  for (const it of queue) {
-    const demoIdentity = it.demoPath || it.demoFilename;
-    const key = `${demoIdentity}::${it.targetPlayer || ""}`;
-    if (!byDemoPlayer.has(key)) {
-      byDemoPlayer.set(key, {
-        demo_filename: it.demoFilename,
-        demo_path: it.demoPath || null,
-        clips: [],
-        target_player: it.targetPlayer || null,
-        target_player_user_id: it.targetPlayerUserId ?? null,
-        target_steam_id: it.targetSteamId || null,
-      });
-    }
-    const clip = { ...stripClientClipUid(it.clipData) };
-    const baseGlobal = stripGlobalPacingMetaKeys(globalPacing);
-    // 全局节奏作为基底，片段自身 pacing_override 覆盖同名字段（优先级更高）
-    const mergedPacing = {
-      ...( Object.keys(baseGlobal).length ? baseGlobal : {} ),
-      ...( it.pacing_override && typeof it.pacing_override === "object" ? it.pacing_override : {} ),
-    };
-    if (Object.keys(mergedPacing).length) {
-      clip.pacing_override = mergedPacing;
-    }
-    byDemoPlayer.get(key).clips.push(clip);
-  }
-  return Array.from(byDemoPlayer.values());
-}
+const DEFAULT_SPEC_PLAYER_VERIFY = Object.freeze({
+  demo_timescale: 0.05,
+  max_retries: 4,
+  per_retry_timeout_sec: 0.6,
+  settle_sec: 0.12,
+});
 
 export default function App() {
+  const navigate = useNavigate();
+  const location = useLocation();
   const [aiMode, setAiMode] = useState(false);
   const [obsConfig, setObsConfig] = useState({ host: "localhost", port: 4455, password: "" });
   /** 服务器是否已有 OBS 密码（GET /api/config 返回脱敏或本地刚保存成功） */
@@ -211,8 +53,7 @@ export default function App() {
   /** GET /api/config 已注入录制队列全局节奏后再允许自动写回，避免覆盖用户在本页会话内的修改 */
   const pacingPersistReadyRef = useRef(false);
   const [llmConfig, setLlmConfig] = useState({
-    provider: "deepseek",
-    model: "deepseek-chat",
+    model: "",
     api_key: "",
     base_url: "",
   });
@@ -233,6 +74,8 @@ export default function App() {
 
   /** 每场 Demo 独立的多选玩家列表（索引 -> string[]） */
   const [selectedPlayers, setSelectedPlayers] = useState({});
+  /** 每场「回合合集」勾选：空 → 请求里发 null（整局合规非赛后）；非空 → 只解析所选回合 */
+  const [freezeToDeathRoundsByMatch, setFreezeToDeathRoundsByMatch] = useState({});
 
   /** 当前 Demo 正在查看的玩家 Tab（索引 -> playerName） */
   const [activePlayerTabs, setActivePlayerTabs] = useState({});
@@ -243,21 +86,49 @@ export default function App() {
   const [parsing, setParsing] = useState(false);
   /** 按场次索引的后台解析（与上传时的全局 parsing 区分，便于切换场次） */
   const [parsingByIndex, setParsingByIndex] = useState({});
-  const [progressText, setProgressText] = useState("");
+  /** 解析分析页内嵌：当前场次解析读条 / 完成或上传成功提示（不占顶部栏） */
+  const [analysisInlineProgress, setAnalysisInlineProgress] = useState(null);
+  const [progressText, setProgressTextInner] = useState("");
+  /** 底部 ProgressBar 可选行为：自动消失、跳转队列按钮 */
+  const [progressToastMeta, setProgressToastMeta] = useState(null);
+  const setProgressText = useCallback((value, toastMeta) => {
+    if (typeof value === "function") {
+      setProgressTextInner(value);
+      setProgressToastMeta(null);
+    } else {
+      setProgressTextInner(value);
+      setProgressToastMeta(toastMeta !== undefined ? toastMeta ?? null : null);
+    }
+  }, []);
+
+  useEffect(() => {
+    setAnalysisInlineProgress(null);
+  }, [currentMatchIndex]);
   const [batchRecording, setBatchRecording] = useState(false);
   const [recordingBlockedMessage, setRecordingBlockedMessage] = useState("");
   const [recordWarmupOpen, setRecordWarmupOpen] = useState(false);
   const [warmupIntent, setWarmupIntent] = useState(null);
-  /** 来自 cs2-insight.config.json，打开录制预热对话框时作为初始选项 */
+  /** @type {null | { restore_required?: boolean; message?: string; cs2_running?: boolean; backup_dir?: string }} */
+  const [configBackupStatus, setConfigBackupStatus] = useState(null);
+  /** 来自 data/cs2-insight.config.json（或 CS2_INSIGHT_CONFIG），打开录制预热对话框时作为初始选项 */
   const [savedRecordWarmupDefaults, setSavedRecordWarmupDefaults] = useState(null);
+  const [cs2ExtraLaunchArgs, setCs2ExtraLaunchArgs] = useState("");
+  const [recordInjectConsoleLines, setRecordInjectConsoleLines] = useState("");
   const [queueDrawerOpen, setQueueDrawerOpen] = useState(false);
+  const [montageDrawerOpen, setMontageDrawerOpen] = useState(false);
   const [commonParamsOpen, setCommonParamsOpen] = useState(false);
+  const [experimentalPovEnabled, setExperimentalPovEnabled] = useState(false);
+  const [specPlayerVerify, setSpecPlayerVerify] = useState(() => ({ ...DEFAULT_SPEC_PLAYER_VERIFY }));
   const [cs2Path, setCs2Path] = useState("");
+  const [ffmpegPath, setFfmpegPath] = useState("");
+  const [montageEncoder, setMontageEncoder] = useState("auto");
   const [cs2FpsMax, setCs2FpsMax] = useState(240);
   const [demoWatchPaths, setDemoWatchPaths] = useState([]);
   const [expectedParsePlayersText, setExpectedParsePlayersText] = useState("");
   const [demoLibraryItems, setDemoLibraryItems] = useState([]);
   const [libraryLoading, setLibraryLoading] = useState(false);
+  /** 仅「扫描本地 demo 库」进行中；不在顶部 ProgressBar 展示，由按钮内 spinner 表示 */
+  const [libraryScanning, setLibraryScanning] = useState(false);
   const [libraryLoadingOverlay, setLibraryLoadingOverlay] = useState(false);
   const [libraryLoadingText, setLibraryLoadingText] = useState("正在加载 Demo...");
   const [libraryPage, setLibraryPage] = useState(1);
@@ -271,7 +142,26 @@ export default function App() {
   const [libraryDeletePrompt, setLibraryDeletePrompt] = useState(null);
   const [librarySearchInput, setLibrarySearchInput] = useState("");
   const [librarySearchQ, setLibrarySearchQ] = useState("");
+  const [libraryAdvFilters, setLibraryAdvFilters] = useState({
+    mapName: "",
+    status: "all",
+    playerQuery: "",
+    steamQuery: "",
+    minKills: "",
+    maxDeaths: "",
+    minAssists: "",
+    minKd: "",
+    roundsMin: "",
+    roundsMax: "",
+    durationMin: "",
+    durationMax: "",
+    dateFrom: "",
+    dateTo: "",
+  });
   const [libraryJumpDraft, setLibraryJumpDraft] = useState("");
+  /** Demo 库列表每页条数（与 GET /demos limit 一致） */
+  const [libraryPageSize, setLibraryPageSize] = useState(10);
+  const libraryPageSizeEffectSkipRef = useRef(false);
   const [libraryBatchModalOpen, setLibraryBatchModalOpen] = useState(false);
   const [llmKeySavedOnServer, setLlmKeySavedOnServer] = useState(false);
   const llmConfigRef = useRef(llmConfig);
@@ -300,10 +190,31 @@ export default function App() {
 
   const activePlayerData = currentParsed?.players?.[currentActivePlayer] ?? null;
   const clips = activePlayerData?.clips ?? [];
+  const timeline = activePlayerData?.timeline ?? null;
+  const roundTimeline = activePlayerData?.round_timeline ?? null;
   const matchMeta = activePlayerData?.match_meta ?? currentUpload?.match_meta ?? null;
 
   const players = currentUpload?.players ?? [];
   const selectedPlayersList = selectedPlayers[currentMatchIndex] ?? [];
+  const freezeToDeathDraft =
+    freezeToDeathRoundsByMatch[currentMatchIndex] ?? { picked: [] };
+  const setFreezeToDeathDraft = useCallback((next) => {
+    setFreezeToDeathRoundsByMatch((prev) => ({
+      ...prev,
+      [currentMatchIndex]: { picked: [...(next?.picked ?? [])] },
+    }));
+  }, [currentMatchIndex]);
+
+  const roundMontageMaxRounds = useMemo(
+    () =>
+      Math.max(
+        1,
+        Number(matchMeta?.total_rounds) ||
+          Number(currentUpload?.match_meta?.total_rounds) ||
+          24
+      ),
+    [matchMeta, currentUpload]
+  );
 
   const expectedPreviewLines = useMemo(
     () =>
@@ -379,6 +290,20 @@ export default function App() {
     setSelectedClientClipUids(new Set());
   }, [currentActivePlayer]);
 
+  // 回合合集勾选被清空后，取消其卡片选中（避免看起来已选却不能入队）
+  useEffect(() => {
+    const ftd = clips.find((c) => isFreezeToDeathCompilation(c));
+    const uid = ftd?.client_clip_uid;
+    if (!uid) return;
+    if ((freezeToDeathDraft?.picked?.length ?? 0) > 0) return;
+    setSelectedClientClipUids((prev) => {
+      if (!prev.has(uid)) return prev;
+      const next = new Set(prev);
+      next.delete(uid);
+      return next;
+    });
+  }, [freezeToDeathDraft?.picked, clips]);
+
   const matchTabsData = useMemo(() => {
     const n = uploadedDemos?.length ?? 0;
     if (!n) return [];
@@ -396,30 +321,54 @@ export default function App() {
     });
   }, [uploadedDemos, parsedMatches]);
 
-  const LIBRARY_PAGE_SIZE = 5;
   const libraryTotalPages =
-    libraryTotal == null ? null : Math.max(1, Math.ceil(libraryTotal / LIBRARY_PAGE_SIZE));
+    libraryTotal == null ? null : Math.max(1, Math.ceil(libraryTotal / libraryPageSize));
+
+  const libraryAdvFiltersKey = useMemo(() => JSON.stringify(libraryAdvFilters), [libraryAdvFilters]);
 
   useEffect(() => {
-    const t = setTimeout(() => {
-      const next = librarySearchInput.trim();
-      setLibrarySearchQ((prev) => {
-        if (prev === next) return prev;
-        setLibraryPage(1);
-        return next;
-      });
-    }, 320);
-    return () => clearTimeout(t);
-  }, [librarySearchInput]);
+    setLibraryPage(1);
+  }, [libraryAdvFiltersKey]);
+
+  const appendDemoLibraryFilterParams = useCallback((params) => {
+    const f = libraryAdvFilters;
+    if (f.mapName.trim()) params.map_name = f.mapName.trim();
+    if (f.status && f.status !== "all") params.status = f.status;
+    const pq = f.playerQuery.trim();
+    if (!pq) return;
+    params.player_query = pq;
+    const num = (v) => {
+      const s = String(v ?? "").trim();
+      if (!s) return null;
+      const n = parseInt(s, 10);
+      return Number.isFinite(n) ? n : null;
+    };
+    const fl = (v) => {
+      const s = String(v ?? "").trim();
+      if (!s) return null;
+      const n = parseFloat(s);
+      return Number.isFinite(n) ? n : null;
+    };
+    const mk = num(f.minKills);
+    if (mk != null) params.min_kills = mk;
+    const xdth = num(f.maxDeaths);
+    if (xdth != null) params.max_deaths = xdth;
+    const ma = num(f.minAssists);
+    if (ma != null) params.min_assists = ma;
+    const mkd = fl(f.minKd);
+    if (mkd != null) params.min_kd = mkd;
+  }, [libraryAdvFilters]);
 
   const refreshDemoLibrary = useCallback(async (page = libraryPage, opts = {}) => {
-    const { manageLoading = true } = opts;
+    const { manageLoading = true, searchQ: searchQOverride } = opts;
     if (manageLoading) setLibraryLoading(true);
     try {
-      const limit = LIBRARY_PAGE_SIZE;
+      const limit = libraryPageSize;
       const offset = (page - 1) * limit;
       const params = { limit, offset };
-      if (librarySearchQ) params.q = librarySearchQ;
+      const qEff = searchQOverride !== undefined ? searchQOverride : librarySearchQ;
+      if (qEff) params.q = qEff;
+      appendDemoLibraryFilterParams(params);
       const { data } = await API.get("/demos", { params });
       setDemoLibraryItems(data.items || []);
       const total = typeof data.total === "number" ? data.total : null;
@@ -435,7 +384,26 @@ export default function App() {
     } finally {
       if (manageLoading) setLibraryLoading(false);
     }
-  }, [libraryPage, librarySearchQ]);
+  }, [libraryPage, librarySearchQ, libraryPageSize, appendDemoLibraryFilterParams]);
+
+  const refreshDemoLibraryRef = useRef(refreshDemoLibrary);
+  refreshDemoLibraryRef.current = refreshDemoLibrary;
+
+  const handleLibrarySearchSubmit = useCallback(() => {
+    const next = librarySearchInput.trim();
+    setLibrarySearchQ(next);
+    setLibraryPage(1);
+    void refreshDemoLibrary(1, { manageLoading: true, searchQ: next });
+  }, [librarySearchInput, refreshDemoLibrary]);
+
+  useEffect(() => {
+    if (!libraryPageSizeEffectSkipRef.current) {
+      libraryPageSizeEffectSkipRef.current = true;
+      return;
+    }
+    setLibraryPage(1);
+    void refreshDemoLibraryRef.current(1, { manageLoading: false });
+  }, [libraryPageSize]);
 
   useEffect(() => {
     libraryPageRef.current = libraryPage;
@@ -499,42 +467,58 @@ export default function App() {
     }
     setLibraryJumpDraft("");
     setLibraryPage(target);
-    void refreshDemoLibrary(target);
+    void refreshDemoLibrary(target, { manageLoading: false });
   }, [libraryJumpDraft, libraryTotalPages, refreshDemoLibrary]);
 
   const handleScanDemos = useCallback(async () => {
-    setLibraryLoading(true);
-    setProgressText("正在扫描监听目录…");
+    setLibraryScanning(true);
     try {
-      await API.post("/demos/scan");
-      setProgressText("扫描完成，正在刷新列表…");
+      const { data } = await API.post("/demos/scan");
       await refreshDemoLibrary(libraryPage, { manageLoading: false });
-      setProgressText("已更新 Demo 库。");
+      const n = data?.discovered_count;
+      if (typeof n === "number" && n > 0) {
+        setProgressText(`扫描完成：当前有 ${n} 个待入库 Demo，可点击「待入库」批量入库。`);
+      }
     } catch (e) {
       setProgressText(`扫描或列表刷新失败: ${e.response?.data?.detail || e.message}`);
     } finally {
-      setLibraryLoading(false);
+      setLibraryScanning(false);
     }
   }, [refreshDemoLibrary, libraryPage]);
-
-  const handleReparseDemo = useCallback(async (id) => {
-    try {
-      await API.post(`/demos/${id}/parse`);
-      await refreshDemoLibrary(libraryPage);
-    } catch (e) {
-      setProgressText(`重解析失败: ${e.response?.data?.detail || e.message}`);
-    }
-  }, [refreshDemoLibrary]);
 
   const handleDeleteDemo = useCallback(
     async (id, rescan) => {
       try {
         await API.delete(`/demos/${id}`, { params: { rescan } });
         setLibraryDeletePrompt(null);
-        await refreshDemoLibrary(libraryPage);
+        await refreshDemoLibrary(libraryPage, { manageLoading: false });
       } catch (e) {
         setProgressText(`删除失败: ${e.response?.data?.detail || e.message}`);
       }
+    },
+    [refreshDemoLibrary, libraryPage]
+  );
+
+  const handleLibraryBatchDelete = useCallback(
+    async (ids, rescan = "skip") => {
+      const list = [...ids];
+      if (!list.length) return;
+      setProgressText(`正在批量删除（0 / ${list.length}）…`);
+      let done = 0;
+      for (const id of list) {
+        try {
+          await API.delete(`/demos/${id}`, { params: { rescan } });
+          done += 1;
+          setProgressText(`正在批量删除（${done} / ${list.length}）…`);
+        } catch (e) {
+          setProgressText(`批量删除失败: ${e.response?.data?.detail || e.message}`);
+          await refreshDemoLibrary(libraryPage, { manageLoading: false });
+          return;
+        }
+      }
+      setSelectedLibraryDemoIds(new Set());
+      setProgressText(`已删除 ${list.length} 条 Demo。`);
+      await refreshDemoLibrary(libraryPage, { manageLoading: false });
     },
     [refreshDemoLibrary, libraryPage]
   );
@@ -544,7 +528,7 @@ export default function App() {
     try {
       await API.patch(`/demos/${libraryRename.id}`, { display_name: libraryRename.draft });
       setLibraryRename(null);
-      await refreshDemoLibrary(libraryPage);
+      await refreshDemoLibrary(libraryPage, { manageLoading: false });
     } catch (e) {
       setProgressText(`改名失败: ${e.response?.data?.detail || e.message}`);
     }
@@ -563,7 +547,12 @@ export default function App() {
           const { data } = await API.get(`/demos/${item.id}/players`);
           const cachedResult = item?.result || null;
           const cachedMeta = cachedResult?.match_meta || null;
+          const ordered =
+            Array.isArray(cachedResult?.analyzed_target_players) && cachedResult.analyzed_target_players.length
+              ? cachedResult.analyzed_target_players.filter((n) => typeof n === "string" && n.trim())
+              : null;
           const autoPlayer =
+            (ordered && ordered[0]) ||
             cachedResult?.auto_target_player ||
             cachedMeta?.target_player ||
             data.players?.[0]?.name ||
@@ -586,19 +575,44 @@ export default function App() {
       setParsedMatches(
         loaded.map((d) => {
           const r = d.cached_result;
+          if (!r) return null;
+          const pObj = r.players;
+          if (pObj && typeof pObj === "object" && !Array.isArray(pObj)) {
+            const names = Object.keys(pObj).filter((n) => String(n).trim());
+            if (!names.length) return null;
+            const players = {};
+            for (const name of names) {
+              const pd = pObj[name];
+              if (!pd || typeof pd !== "object") continue;
+              players[name] = {
+                clips: ensureClientClipUidsOnClips(pd.clips || []),
+                match_meta: pd.match_meta || r.match_meta || d.match_meta || null,
+                timeline: pd.timeline ?? null,
+                round_timeline: pd.round_timeline ?? null,
+              };
+            }
+            if (!Object.keys(players).length) return null;
+            return {
+              players,
+              demo_path: d.path,
+              demo_filename: d.filename,
+            };
+          }
           const ap = d.cached_auto_player;
-          if (!r || !ap || !Array.isArray(r.clips)) return null;
+          if (!ap || !Array.isArray(r.clips)) return null;
           return {
             players: {
               [ap]: {
                 clips: ensureClientClipUidsOnClips(r.clips || []),
                 match_meta: r.match_meta || d.match_meta || null,
+                timeline: r.timeline ?? null,
+                round_timeline: r.round_timeline ?? null,
               },
             },
             demo_path: d.path,
             demo_filename: d.filename,
           };
-        })
+        }),
       );
       const idMap = {};
       const selectedMap = {};
@@ -609,22 +623,62 @@ export default function App() {
           const r = resolvedByDemoId[x.id] ?? [];
           selectedMap[i] = r;
           if (r.length) tabMap[i] = r[0];
-        } else if (x.cached_result && x.cached_auto_player) {
-          selectedMap[i] = [x.cached_auto_player];
-          tabMap[i] = x.cached_auto_player;
+        } else if (x.cached_result) {
+          const r = x.cached_result;
+          let names = [];
+          if (Array.isArray(r.analyzed_target_players) && r.analyzed_target_players.length) {
+            names = r.analyzed_target_players.filter((n) => typeof n === "string" && n.trim());
+          } else if (r.players && typeof r.players === "object" && !Array.isArray(r.players)) {
+            names = Object.keys(r.players).filter((n) => String(n).trim());
+          }
+          if (names.length) {
+            selectedMap[i] = names;
+            tabMap[i] = names[0];
+          } else if (x.cached_auto_player) {
+            selectedMap[i] = [x.cached_auto_player];
+            tabMap[i] = x.cached_auto_player;
+          }
         }
       });
       setLibraryDemoIdsByIndex(idMap);
       setCurrentMatchIndex(0);
       setSelectedPlayers(selectedMap);
       setActivePlayerTabs(tabMap);
+      const ftdByIndex = {};
+      loaded.forEach((x, i) => {
+        const r = x.cached_result;
+        if (!r) return;
+        let clips = null;
+        const pObj = r.players;
+        if (pObj && typeof pObj === "object" && !Array.isArray(pObj)) {
+          const keys = Object.keys(pObj).filter((k) => String(k).trim());
+          const ref =
+            typeof r.auto_target_player === "string" &&
+            r.auto_target_player.trim() &&
+            pObj[r.auto_target_player]
+              ? r.auto_target_player
+              : keys[0];
+          clips = ref && pObj[ref] && Array.isArray(pObj[ref].clips) ? pObj[ref].clips : null;
+        } else {
+          clips = r.clips;
+        }
+        if (!Array.isArray(clips)) return;
+        const ftd = clips.find(
+          (c) => c.category === "compilation" && c.compilation_kind === "freeze_to_death"
+        );
+        if (ftd) {
+          const tr =
+            x.cached_result?.match_meta?.total_rounds ??
+            x.match_meta?.total_rounds ??
+            24;
+          const maxR = Math.max(1, Math.min(64, Number(tr) || 24));
+          ftdByIndex[i] = freezeToDeathDraftFromClipFilter(ftd.freeze_to_death_round_filter, maxR);
+        }
+      });
+      setFreezeToDeathRoundsByMatch(ftdByIndex);
       setSelectedClientClipUids(new Set());
-      const cachedCount = loaded.filter((x) => Boolean(x.cached_result)).length;
-      setProgressText(
-        cachedCount > 0
-          ? `已载入 ${loaded.length} 个 Demo，其中 ${cachedCount} 个命中缓存并已自动展示片段。`
-          : `已从 Demo 库载入 ${loaded.length} 个 Demo`
-      );
+      setProgressText("");
+      navigate("/analysis");
       return loaded;
     } catch (e) {
       setProgressText(`加载 Demo 库失败: ${e.response?.data?.detail || e.message}`);
@@ -635,7 +689,7 @@ export default function App() {
         setLibraryLoadingText("正在加载 Demo...");
       }
     }
-  }, []);
+  }, [navigate]);
 
   const handleLoadSelectedLibraryDemos = useCallback(async () => {
     const ids = Array.from(selectedLibraryDemoIds);
@@ -665,6 +719,7 @@ export default function App() {
       const want = libraryTotal != null ? Math.min(libraryTotal, cap) : cap;
       const params = { limit: want, offset: 0 };
       if (librarySearchQ) params.q = librarySearchQ;
+      appendDemoLibraryFilterParams(params);
       const { data } = await API.get("/demos", { params });
       const rows = data.items || [];
       setSelectedLibraryDemoIds(new Set(rows.map((it) => it.id)));
@@ -674,7 +729,7 @@ export default function App() {
     } catch (e) {
       setProgressText(`全选失败: ${e.response?.data?.detail || e.message}`);
     }
-  }, [libraryTotal, librarySearchQ]);
+  }, [libraryTotal, librarySearchQ, appendDemoLibraryFilterParams]);
 
   const clearLibrarySelection = useCallback(() => {
     setSelectedLibraryDemoIds(new Set());
@@ -706,7 +761,33 @@ export default function App() {
           });
         }
         if (typeof data.ai_mode === "boolean") setAiMode(data.ai_mode);
+        if (typeof data.experimental?.pov_enabled === "boolean") {
+          setExperimentalPovEnabled(data.experimental.pov_enabled);
+        }
+        if (data.spec_player_verify && typeof data.spec_player_verify === "object") {
+          const spv = data.spec_player_verify;
+          setSpecPlayerVerify((prev) => ({
+            ...prev,
+            ...(typeof spv.demo_timescale === "number" && Number.isFinite(spv.demo_timescale)
+              ? { demo_timescale: spv.demo_timescale }
+              : {}),
+            ...(typeof spv.max_retries === "number" && Number.isFinite(spv.max_retries)
+              ? { max_retries: Math.round(spv.max_retries) }
+              : {}),
+            ...(typeof spv.per_retry_timeout_sec === "number" &&
+            Number.isFinite(spv.per_retry_timeout_sec)
+              ? { per_retry_timeout_sec: spv.per_retry_timeout_sec }
+              : {}),
+            ...(typeof spv.settle_sec === "number" && Number.isFinite(spv.settle_sec)
+              ? { settle_sec: spv.settle_sec }
+              : {}),
+          }));
+        }
         if (data.cs2_path) setCs2Path(data.cs2_path);
+        if (typeof data.ffmpeg_path === "string") setFfmpegPath(data.ffmpeg_path);
+        if (typeof data.montage_encoder === "string" && data.montage_encoder.trim()) {
+          setMontageEncoder(data.montage_encoder.trim().toLowerCase());
+        }
         if (typeof data.cs2_fps_max === "number") setCs2FpsMax(data.cs2_fps_max);
         if (Array.isArray(data.demo_watch_paths)) setDemoWatchPaths(data.demo_watch_paths);
         if (Array.isArray(data.expected_parse_players)) {
@@ -718,6 +799,12 @@ export default function App() {
           !Array.isArray(data.default_record_warmup)
         ) {
           setSavedRecordWarmupDefaults(data.default_record_warmup);
+        }
+        if (typeof data.cs2_extra_launch_args === "string") {
+          setCs2ExtraLaunchArgs(data.cs2_extra_launch_args);
+        }
+        if (typeof data.record_inject_console_lines === "string") {
+          setRecordInjectConsoleLines(data.record_inject_console_lines);
         }
         if (
           data.recording_global_pacing &&
@@ -741,6 +828,19 @@ export default function App() {
     };
   }, []);
 
+  const refreshConfigBackupStatus = useCallback(async () => {
+    try {
+      const { data } = await API.get("/config-backup/status");
+      setConfigBackupStatus(data);
+    } catch {
+      setConfigBackupStatus(null);
+    }
+  }, []);
+
+  useEffect(() => {
+    void refreshConfigBackupStatus();
+  }, [refreshConfigBackupStatus]);
+
   useEffect(() => {
     if (!pacingPersistReadyRef.current) return;
     const t = setTimeout(() => {
@@ -750,9 +850,38 @@ export default function App() {
   }, [globalPacing]);
 
   useEffect(() => {
-    // 切页拉一次；库变更另由 /api/demos/stream（SSE）防抖刷新。新增文件需点「刷新」扫描入库。
-    void refreshDemoLibrary(libraryPage);
+    if (!pacingPersistReadyRef.current) return;
+    const t = setTimeout(() => {
+      void API.put("config", { spec_player_verify: specPlayerVerify }).catch(() => {});
+    }, 600);
+    return () => clearTimeout(t);
+  }, [specPlayerVerify]);
+
+  useEffect(() => {
+    // 切页拉一次；库变更另由 /api/demos/stream（SSE）防抖刷新。新增文件需点「扫描本地 demo 库」入库。
+    void refreshDemoLibrary(libraryPage, { manageLoading: false });
   }, [refreshDemoLibrary, libraryPage]);
+
+  const hasLibraryAdvancedFilters = useMemo(() => {
+    const f = libraryAdvFilters;
+    const numOrStr = (v) => String(v ?? "").trim();
+    return !!(
+      f.mapName.trim() ||
+      (f.status && f.status !== "all") ||
+      f.playerQuery.trim() ||
+      f.steamQuery.trim() ||
+      numOrStr(f.minKills) ||
+      numOrStr(f.maxDeaths) ||
+      numOrStr(f.minAssists) ||
+      numOrStr(f.minKd) ||
+      numOrStr(f.roundsMin) ||
+      numOrStr(f.roundsMax) ||
+      numOrStr(f.durationMin) ||
+      numOrStr(f.durationMax) ||
+      numOrStr(f.dateFrom) ||
+      numOrStr(f.dateTo)
+    );
+  }, [libraryAdvFilters]);
 
   const handleUpload = useCallback(async (files) => {
     const list = Array.isArray(files) ? files : [files];
@@ -772,39 +901,64 @@ export default function App() {
       setCurrentMatchIndex(0);
       setSelectedPlayers({});
       setActivePlayerTabs({});
+      setFreezeToDeathRoundsByMatch({});
       setSelectedClientClipUids(new Set());
-      setProgressText(
+      const uploadDoneMsg =
         uploads.length > 1
           ? `已上传 ${uploads.length} 个 Demo。请切换场次，分别为每场选择玩家并点击「开始分析」。`
-          : "上传完成，请选择要分析的玩家后点击「开始分析」。"
-      );
+          : "上传完成，请选择要分析的玩家后点击「开始分析」。";
+      setProgressText("");
+      setAnalysisInlineProgress({ active: false, text: uploadDoneMsg });
+      navigate("/analysis");
     } catch (e) {
       setProgressText(`上传失败: ${e.response?.data?.detail || e.message}`);
     } finally {
       setParsing(false);
     }
-  }, []);
+  }, [navigate]);
+
+  const roundMontageCanEnqueue = useMemo(() => {
+    const p = freezeToDeathDraft?.picked ?? [];
+    return p.length > 0;
+  }, [freezeToDeathDraft]);
 
   const regularSelectableTotal = useMemo(
     () =>
-      clips.filter(
-        (c) =>
-          c.category !== "meme_death" &&
-          c.client_clip_uid &&
-          !queuedClientClipUidsForCurrentDemo.has(c.client_clip_uid)
-      ).length,
-    [clips, queuedClientClipUidsForCurrentDemo]
+      clips.filter((c) => {
+        if (c.category === "meme_death" || !c.client_clip_uid) return false;
+        if (queuedClientClipUidsForCurrentDemo.has(c.client_clip_uid)) return false;
+        if (isFreezeToDeathCompilation(c) && !roundMontageCanEnqueue) return false;
+        return true;
+      }).length,
+    [clips, queuedClientClipUidsForCurrentDemo, roundMontageCanEnqueue]
   );
   const selectedRegularCount = useMemo(
     () =>
-      clips.filter(
-        (c) =>
-          c.category !== "meme_death" &&
-          c.client_clip_uid &&
-          selectedClientClipUids.has(c.client_clip_uid) &&
-          !queuedClientClipUidsForCurrentDemo.has(c.client_clip_uid)
-      ).length,
-    [clips, selectedClientClipUids, queuedClientClipUidsForCurrentDemo]
+      clips.filter((c) => {
+        if (c.category === "meme_death" || !c.client_clip_uid) return false;
+        if (!selectedClientClipUids.has(c.client_clip_uid)) return false;
+        if (queuedClientClipUidsForCurrentDemo.has(c.client_clip_uid)) return false;
+        if (isFreezeToDeathCompilation(c) && !roundMontageCanEnqueue) return false;
+        return true;
+      }).length,
+    [
+      clips,
+      selectedClientClipUids,
+      queuedClientClipUidsForCurrentDemo,
+      roundMontageCanEnqueue,
+    ]
+  );
+
+  const canAddAllHighlights = useMemo(
+    () =>
+      Boolean(
+        parsedMatches?.some((pm) =>
+          Object.values(pm?.players ?? {}).some((pd) =>
+            pd.clips?.some((c) => c.category === "highlight")
+          )
+        )
+      ),
+    [parsedMatches]
   );
 
   /**
@@ -827,19 +981,21 @@ export default function App() {
       setParsingByIndex((prev) => ({ ...prev, [idx]: true }));
       const viewingHere = currentMatchIndexRef.current === idx;
       if (viewingHere && !quietProgress) {
-        setProgressText(`正在解析「${fn}」…`);
+        setProgressText("");
+        setAnalysisInlineProgress({ active: true, text: `正在解析「${fn}」…` });
         setSelectedClientClipUids(new Set());
       }
 
       try {
         const activeLibraryDemoId = libIds[idx] ?? demos[idx]?.id;
+        const body = { target_players: names };
+        const ftdCfg = freezeToDeathRoundsByMatch[idx] ?? { picked: [] };
+        const ftdPicked = [...(ftdCfg.picked || [])].sort((a, b) => a - b);
+        // null = 后端按全部合规非赛后回合生成回合合集；[] 会显式跳过生成（见 demo_parser）
+        body.freeze_to_death_rounds = ftdPicked.length ? ftdPicked : null;
         const { data } = activeLibraryDemoId
-          ? await API.post(`/demos/${activeLibraryDemoId}/analyze`, {
-              target_players: names,
-            })
-          : await API.post(`/demo/parse-multi?filename=${encodeURIComponent(fn)}`, {
-              target_players: names,
-            });
+          ? await API.post(`/demos/${activeLibraryDemoId}/analyze`, body)
+          : await API.post(`/demo/parse-multi?filename=${encodeURIComponent(fn)}`, body);
 
         const processedPlayers = {};
         for (const [playerName, playerData] of Object.entries(data.players ?? {})) {
@@ -862,9 +1018,34 @@ export default function App() {
           return base;
         });
 
+        const firstMeta = Object.values(processedPlayers)[0]?.match_meta;
+        const ftdMaxRounds = Math.max(
+          1,
+          Math.min(
+            64,
+            Number(firstMeta?.total_rounds) ||
+              Number(demos[idx]?.match_meta?.total_rounds) ||
+              24
+          )
+        );
+
+        const refPlayer = names[0];
+        const refClips = processedPlayers[refPlayer]?.clips ?? [];
+        const ftdClip = refClips.find(
+          (c) => c.category === "compilation" && c.compilation_kind === "freeze_to_death"
+        );
+        setFreezeToDeathRoundsByMatch((prev) => ({
+          ...prev,
+          [idx]: ftdClip
+            ? freezeToDeathDraftFromClipFilter(
+                ftdClip.freeze_to_death_round_filter,
+                ftdMaxRounds
+              )
+            : { picked: [] },
+        }));
+
         setActivePlayerTabs((prev) => ({ ...prev, [idx]: names[0] }));
 
-        const firstMeta = Object.values(processedPlayers)[0]?.match_meta;
         const rounds = firstMeta?.total_rounds ?? "?";
         const totalRegular = Object.values(processedPlayers).reduce(
           (s, pd) => s + (pd.clips ?? []).filter((c) => c.category !== "meme_death").length,
@@ -881,13 +1062,13 @@ export default function App() {
             ? `「${fn}」分析完成 — ${rounds} 回合，${playerLabel}，常规片段 ${totalRegular} 个，另含下饭 ${totalMeme} 段。`
             : `「${fn}」分析完成 — ${rounds} 回合，${playerLabel}，共 ${totalRegular} 个片段。`;
         if (!quietProgress) {
-          if (viewingHere) setProgressText(doneMsg);
+          if (viewingHere) setAnalysisInlineProgress({ active: false, text: doneMsg });
           else setProgressText((prev) => (prev ? `${prev}\n${doneMsg}` : doneMsg));
         }
       } catch (e) {
         const err = `解析失败「${fn}」: ${e.response?.data?.detail || e.message}`;
         if (!quietProgress) {
-          if (viewingHere) setProgressText(err);
+          if (viewingHere) setAnalysisInlineProgress({ active: false, text: err });
           else setProgressText((prev) => (prev ? `${prev}\n${err}` : err));
         }
       } finally {
@@ -898,7 +1079,7 @@ export default function App() {
         });
       }
     },
-    [uploadedDemos, selectedPlayers, libraryDemoIdsByIndex]
+    [uploadedDemos, selectedPlayers, libraryDemoIdsByIndex, freezeToDeathRoundsByMatch]
   );
 
   const handleParse = useCallback(async () => {
@@ -978,9 +1159,7 @@ export default function App() {
             setLibraryLoadingText(`正在解析高光（${done} / ${specs.length} 场）…`);
           }
         });
-        setProgressText(
-          `已载入 ${loaded.length} 个 Demo，并完成 ${specs.length} 场高光解析。`
-        );
+        setProgressText("");
       } catch (e) {
         setProgressText(`载入并解析失败: ${e.response?.data?.detail || e.message}`);
       } finally {
@@ -996,6 +1175,11 @@ export default function App() {
   const handleToggleClip = useCallback(
     (clientClipUid) => {
       if (!clientClipUid || queuedClientClipUidsForCurrentDemo.has(clientClipUid)) return;
+      const clip = clips.find((c) => c.client_clip_uid === clientClipUid);
+      if (clip && isFreezeToDeathCompilation(clip)) {
+        const p = freezeToDeathDraft?.picked ?? [];
+        if (!p.length) return;
+      }
       setSelectedClientClipUids((prev) => {
         const next = new Set(prev);
         if (next.has(clientClipUid)) next.delete(clientClipUid);
@@ -1003,23 +1187,23 @@ export default function App() {
         return next;
       });
     },
-    [queuedClientClipUidsForCurrentDemo]
+    [queuedClientClipUidsForCurrentDemo, clips, freezeToDeathDraft]
   );
 
   const handleSelectAll = useCallback(() => {
     setSelectedClientClipUids((prev) => {
       const next = new Set(prev);
       clips
-        .filter(
-          (c) =>
-            c.category !== "meme_death" &&
-            c.client_clip_uid &&
-            !queuedClientClipUidsForCurrentDemo.has(c.client_clip_uid)
-        )
+        .filter((c) => {
+          if (c.category === "meme_death" || !c.client_clip_uid) return false;
+          if (queuedClientClipUidsForCurrentDemo.has(c.client_clip_uid)) return false;
+          if (isFreezeToDeathCompilation(c) && !roundMontageCanEnqueue) return false;
+          return true;
+        })
         .forEach((c) => next.add(c.client_clip_uid));
       return next;
     });
-  }, [clips, queuedClientClipUidsForCurrentDemo]);
+  }, [clips, queuedClientClipUidsForCurrentDemo, roundMontageCanEnqueue]);
 
   const handleDeselectAll = useCallback(() => {
     setSelectedClientClipUids(new Set());
@@ -1064,9 +1248,13 @@ export default function App() {
   const handleAddSelectedToQueue = useCallback(() => {
     if (!currentParsed || selectedClientClipUids.size === 0) return;
     const meta = queueItemMetaForIndex(currentMatchIndex);
-    const toAdd = clips
-      .filter((c) => c.client_clip_uid && selectedClientClipUids.has(c.client_clip_uid))
-      .map((c) => ({
+    const ftdPicksSorted = [...(freezeToDeathDraft?.picked ?? [])].sort((a, b) => a - b);
+    const candidates = clips.filter(
+      (c) => c.client_clip_uid && selectedClientClipUids.has(c.client_clip_uid)
+    );
+    const toAdd = [];
+    for (const c of candidates) {
+      const row = {
         demoPath: meta.demoPath,
         demoFilename: meta.demoFilename,
         targetPlayer: meta.targetPlayer,
@@ -1075,10 +1263,35 @@ export default function App() {
         clipId: c.clip_id,
         clientClipUid: c.client_clip_uid,
         clipData: { ...c },
-      }));
+      };
+      if (isFreezeToDeathCompilation(c)) {
+        const sliced = sliceFreezeToDeathClipForEnqueue(c, ftdPicksSorted);
+        if (!sliced.ok) {
+          setProgressText(sliced.error);
+          return;
+        }
+        toAdd.push({
+          ...row,
+          clientClipUid: sliced.clip.client_clip_uid,
+          clipData: sliced.clip,
+          freezeToDeathQueueRounds: [...ftdPicksSorted],
+        });
+      } else {
+        toAdd.push(row);
+      }
+    }
+    if (!toAdd.length) {
+      return;
+    }
     addToQueue(toAdd);
     setSelectedClientClipUids(new Set());
-    setProgressText(`已加入录制队列 ${toAdd.length} 条（当前场次）。`);
+    const skipped = candidates.length - toAdd.length;
+    const skipHint =
+      skipped > 0 ? `（已跳过 ${skipped} 条未满足条件的片段）` : "";
+    setProgressText(`已加入录制队列 ${toAdd.length} 条（当前场次）${skipHint}`, {
+      autoDismissMs: 2000,
+      queueLink: true,
+    });
   }, [
     currentParsed,
     clips,
@@ -1086,6 +1299,7 @@ export default function App() {
     addToQueue,
     currentMatchIndex,
     queueItemMetaForIndex,
+    freezeToDeathDraft,
   ]);
 
   const handleAddAllHighlightsAllMatches = useCallback(() => {
@@ -1116,8 +1330,158 @@ export default function App() {
       return;
     }
     addToQueue(toAdd);
-    setProgressText(`已将 ${toAdd.length} 条高光片段加入队列（跨场次）。`);
+    setProgressText(`已将 ${toAdd.length} 条高光片段加入队列（跨场次）。`, {
+      autoDismissMs: 2000,
+      queueLink: true,
+    });
   }, [parsedMatches, addToQueue, queueItemMetaForPlayer, queuedClientClipUidsGlobal]);
+
+  const handleAddTimelineEventToQueue = useCallback(
+    (event, roundRow) => {
+      const hasWindow =
+        (event?.suggested_clip && typeof event.suggested_clip === "object") ||
+        (event?.start_tick != null && event?.end_tick != null);
+      if (!currentParsed || !hasWindow) return;
+      const meta = queueItemMetaForIndex(currentMatchIndex);
+      const mapName = matchMeta?.map_name || "";
+      const clipData = buildTimelineEventClipData({
+        event,
+        mapName,
+        targetPlayer: meta.targetPlayer,
+        round: roundRow?.round ?? event?.round,
+      });
+      const uid = clipData.client_clip_uid;
+      const qk = queueItemClientUid({
+        clientClipUid: uid,
+        clipData,
+        demoFilename: meta.demoFilename,
+        clipId: clipData.clip_id,
+      });
+      if (queuedClientClipUidsGlobal.has(qk)) {
+        setProgressText("该项已在录制队列中。", { autoDismissMs: 2000 });
+        return;
+      }
+      addToQueue({
+        demoPath: meta.demoPath,
+        demoFilename: meta.demoFilename,
+        targetPlayer: meta.targetPlayer,
+        targetPlayerUserId: meta.targetPlayerUserId,
+        targetSteamId: meta.targetSteamId,
+        clipId: clipData.clip_id,
+        clientClipUid: uid,
+        clipData,
+      });
+      setProgressText("已加入录制队列（时间线）", { autoDismissMs: 2000, queueLink: true });
+    },
+    [
+      currentParsed,
+      currentMatchIndex,
+      queueItemMetaForIndex,
+      matchMeta,
+      addToQueue,
+      queuedClientClipUidsGlobal,
+      setProgressText,
+    ],
+  );
+
+  const handleAddTimelineRoundToQueue = useCallback(
+    (roundRow) => {
+      if (!currentParsed || !roundRow) return;
+      const meta = queueItemMetaForIndex(currentMatchIndex);
+      const mapName = matchMeta?.map_name || "";
+      const clipData = buildTimelineRoundClipData({ roundRow, mapName, targetPlayer: meta.targetPlayer });
+      const uid = clipData.client_clip_uid;
+      const qk = queueItemClientUid({
+        clientClipUid: uid,
+        clipData,
+        demoFilename: meta.demoFilename,
+        clipId: clipData.clip_id,
+      });
+      if (queuedClientClipUidsGlobal.has(qk)) {
+        setProgressText("该回合整段已在队列中。", { autoDismissMs: 2000 });
+        return;
+      }
+      addToQueue({
+        demoPath: meta.demoPath,
+        demoFilename: meta.demoFilename,
+        targetPlayer: meta.targetPlayer,
+        targetPlayerUserId: meta.targetPlayerUserId,
+        targetSteamId: meta.targetSteamId,
+        clipId: clipData.clip_id,
+        clientClipUid: uid,
+        clipData,
+      });
+      setProgressText("已加入本回合到录制队列", { autoDismissMs: 2000, queueLink: true });
+    },
+    [
+      currentParsed,
+      currentMatchIndex,
+      queueItemMetaForIndex,
+      matchMeta,
+      addToQueue,
+      queuedClientClipUidsGlobal,
+      setProgressText,
+    ],
+  );
+
+  const handleAddTimelineEventsBatchToQueue = useCallback(
+    (eventList) => {
+      if (!currentParsed || !Array.isArray(eventList) || !eventList.length) return;
+      const meta = queueItemMetaForIndex(currentMatchIndex);
+      const mapName = matchMeta?.map_name || "";
+      const toAdd = [];
+      for (const ev of eventList) {
+        if (!ev?.suggested_clip && (ev?.start_tick == null || ev?.end_tick == null)) continue;
+        const clipData = buildTimelineEventClipData({
+          event: ev,
+          mapName,
+          targetPlayer: meta.targetPlayer,
+          round: ev.round,
+        });
+        const uid = clipData.client_clip_uid;
+        const qk = queueItemClientUid({
+          clientClipUid: uid,
+          clipData,
+          demoFilename: meta.demoFilename,
+          clipId: clipData.clip_id,
+        });
+        if (queuedClientClipUidsGlobal.has(qk)) continue;
+        toAdd.push({
+          demoPath: meta.demoPath,
+          demoFilename: meta.demoFilename,
+          targetPlayer: meta.targetPlayer,
+          targetPlayerUserId: meta.targetPlayerUserId,
+          targetSteamId: meta.targetSteamId,
+          clipId: clipData.clip_id,
+          clientClipUid: uid,
+          clipData,
+        });
+      }
+      if (!toAdd.length) {
+        setProgressText("所选时间线事件均已在队列中。", { autoDismissMs: 2000 });
+        return;
+      }
+      addToQueue(toAdd);
+      setProgressText(`已加入 ${toAdd.length} 条时间线片段`, { autoDismissMs: 2000, queueLink: true });
+    },
+    [
+      currentParsed,
+      currentMatchIndex,
+      queueItemMetaForIndex,
+      matchMeta,
+      addToQueue,
+      queuedClientClipUidsGlobal,
+      setProgressText,
+    ],
+  );
+
+  const persistCs2RecordExtras = useCallback(async (payload) => {
+    try {
+      await API.put("config", payload);
+    } catch {
+      /* silent */
+    }
+  }, []);
 
   const persistWarmupDefaults = useCallback(async (obj) => {
     setSavedRecordWarmupDefaults(obj);
@@ -1128,12 +1492,31 @@ export default function App() {
     }
   }, []);
 
+  const persistExperimentalPov = useCallback(async (enabled) => {
+    try {
+      await API.put("config", { experimental: { pov_enabled: enabled } });
+      setExperimentalPovEnabled(!!enabled);
+    } catch {
+      /* silent */
+    }
+  }, []);
+
+  const patchSpecPlayerVerify = useCallback((partial) => {
+    setSpecPlayerVerify((prev) => ({ ...prev, ...partial }));
+  }, []);
+
   const openBatchWarmup = useCallback(() => {
     if (!queue.length) return;
+    if (configBackupStatus?.restore_required) {
+      setRecordingBlockedMessage(
+        "检测到上次录制可能异常退出，玩家配置尚未恢复。\n请先点击「一键恢复玩家配置」，恢复完成后再开始新的录制。",
+      );
+      return;
+    }
     setQueueDrawerOpen(false);
     setWarmupIntent("batch");
     setRecordWarmupOpen(true);
-  }, [queue.length]);
+  }, [queue.length, configBackupStatus?.restore_required]);
 
   const handleWarmupConfirm = useCallback(
     async (warmup) => {
@@ -1147,7 +1530,7 @@ export default function App() {
         setBatchRecording(true);
         setProgressText("正在执行批量 OBS 导播…");
         try {
-          const groups = buildBatchGroupsFromQueue(queue, globalPacing);
+          const groups = buildBatchGroupsFromQueue(queue, useRecordingQueue.getState().globalPacing);
           const { data } = await API.post("/record/batch", { groups, warmup, obs: obsConfig });
           const results = data.results ?? [];
           const ok = results.filter((r) => r.status === "recorded").length;
@@ -1155,9 +1538,12 @@ export default function App() {
           if (aborted > 0) {
             setProgressText(
               `批量录制已结束：成功 ${ok}，中止 ${aborted}，其余 ${results.length - ok - aborted} 条；共 ${results.length} 个片段。`,
+              { autoDismissMs: 3000 },
             );
           } else {
-            setProgressText(`批量录制完成！成功 ${ok} / ${results.length} 个片段。`);
+            setProgressText(`批量录制完成！成功 ${ok} / ${results.length} 个片段。`, {
+              autoDismissMs: 3000,
+            });
           }
           clearQueue();
         } catch (e) {
@@ -1168,13 +1554,57 @@ export default function App() {
           setProgressText(`批量录制失败: ${detail}`);
         } finally {
           setBatchRecording(false);
+          void refreshConfigBackupStatus();
         }
         return;
       }
       setWarmupIntent(null);
     },
-    [warmupIntent, queue, clearQueue, obsConfig, globalPacing, persistWarmupDefaults]
+    [
+      warmupIntent,
+      queue,
+      clearQueue,
+      obsConfig,
+      globalPacing,
+      persistWarmupDefaults,
+      refreshConfigBackupStatus,
+    ]
   );
+
+  const handleRestorePlayerConfig = useCallback(async () => {
+    setProgressText("正在恢复玩家配置…");
+    try {
+      const { data } = await API.post("/config-backup/restore");
+      if (data?.ok) {
+        setProgressText(data.message || "玩家配置已恢复");
+      } else {
+        setProgressText(data?.message || "部分配置恢复失败");
+      }
+      await refreshConfigBackupStatus();
+    } catch (e) {
+      const st = e.response?.status;
+      const det = e.response?.data?.detail;
+      if (st === 409 && det?.code === "CS2_RUNNING") {
+        setRecordingBlockedMessage(
+          "CS2 正在运行，无法覆盖配置文件。\n请先关闭 CS2，然后再次点击一键恢复。",
+        );
+      } else {
+        setProgressText(`恢复失败: ${formatRecordingApiError(e)}`);
+      }
+      await refreshConfigBackupStatus();
+    }
+  }, [refreshConfigBackupStatus]);
+
+  const handleOpenConfigBackupDir = useCallback(async () => {
+    try {
+      const { data } = await API.post("/config-backup/open-dir");
+      if (data && data.ok === false && data.backup_dir) {
+        setProgressText(`${data.message || "请手动打开"} ${data.backup_dir}`);
+      }
+    } catch (e) {
+      setProgressText(`打开备份目录失败: ${formatRecordingApiError(e)}`);
+    }
+  }, []);
 
   const handleAbortBatchRecording = useCallback(async () => {
     try {
@@ -1266,7 +1696,6 @@ export default function App() {
     await Promise.resolve();
     const c = llmConfigRef.current;
     const payload = {
-      provider: c.provider,
       model: c.model,
       base_url: (c.base_url || "").trim() || null,
     };
@@ -1278,6 +1707,16 @@ export default function App() {
       await API.put("config", { llm: payload });
       if (k && !k.startsWith("****")) {
         setLlmKeySavedOnServer(true);
+      } else {
+        try {
+          const { data } = await API.get("config");
+          const rawKey = data.llm?.api_key ?? "";
+          setLlmKeySavedOnServer(
+            typeof rawKey === "string" && rawKey.trim().length > 0 && rawKey.startsWith("****")
+          );
+        } catch {
+          /* keep prior llmKeySavedOnServer */
+        }
       }
     } catch (e) {
       setProgressText(`保存大模型配置失败: ${e.response?.data?.detail || e.message}`);
@@ -1314,8 +1753,10 @@ export default function App() {
     setCurrentMatchIndex(0);
     setSelectedPlayers({});
     setActivePlayerTabs({});
+    setFreezeToDeathRoundsByMatch({});
     setSelectedClientClipUids(new Set());
     setProgressText("");
+    setAnalysisInlineProgress(null);
   }, []);
 
   const handleDetectCs2 = useCallback(async () => {
@@ -1331,6 +1772,211 @@ export default function App() {
     }
   }, []);
 
+  const saveExpectedPlayersFromList = useCallback(async (playersList) => {
+    const cleaned = Array.isArray(playersList)
+      ? [...new Set(playersList.map((s) => String(s).trim()).filter(Boolean))].slice(0, 50)
+      : [];
+    try {
+      await API.put("config", { expected_parse_players: cleaned });
+      setExpectedParsePlayersText(cleaned.join("\n"));
+      setProgressText(
+        cleaned.length ? `已保存 ${cleaned.length} 个关注昵称。` : "已清空关注名单。",
+        { autoDismissMs: 2500 },
+      );
+    } catch (e) {
+      setProgressText(`保存关注名单失败: ${e.response?.data?.detail || e.message}`);
+    }
+  }, []);
+
+  const handleSaveAllSettingsPage = useCallback(
+    async (expectedPlayersList) => {
+      const arr = Array.isArray(expectedPlayersList)
+        ? [...new Set(expectedPlayersList.map((s) => String(s).trim()).filter(Boolean))].slice(0, 50)
+        : [];
+      try {
+        await API.put("config", {
+          cs2_path: cs2Path,
+          ffmpeg_path: ffmpegPath,
+          montage_encoder: montageEncoder,
+          cs2_fps_max: cs2FpsMax,
+          expected_parse_players: arr,
+        });
+        setExpectedParsePlayersText(arr.join("\n"));
+        await persistLlmConfig();
+        setProgressText("设置已保存。", { autoDismissMs: 2200 });
+      } catch (e) {
+        setProgressText(`保存失败: ${e.response?.data?.detail || e.message}`);
+      }
+    },
+    [cs2Path, ffmpegPath, montageEncoder, cs2FpsMax, persistLlmConfig, setExpectedParsePlayersText],
+  );
+
+  const handleExportSettingsConfig = useCallback(async () => {
+    try {
+      const { data } = await API.get("config");
+      const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json;charset=utf-8" });
+      const a = document.createElement("a");
+      a.href = URL.createObjectURL(blob);
+      a.download = `cs2-insight-config-${new Date().toISOString().slice(0, 19).replace(/[:T]/g, "-")}.json`;
+      a.click();
+      URL.revokeObjectURL(a.href);
+      setProgressText("已导出配置 JSON（导出中的密钥为脱敏显示）。", { autoDismissMs: 3500 });
+    } catch (e) {
+      setProgressText(`导出失败: ${e.response?.data?.detail || e.message}`);
+    }
+  }, []);
+
+  const applyImportedSettings = useCallback(async (raw) => {
+    if (!raw || typeof raw !== "object") {
+      setProgressText("导入失败：不是有效的 JSON 对象。");
+      return;
+    }
+    try {
+      const put = {};
+      if (typeof raw.cs2_path === "string") {
+        put.cs2_path = raw.cs2_path;
+        setCs2Path(raw.cs2_path);
+      }
+      if (typeof raw.ffmpeg_path === "string") {
+        put.ffmpeg_path = raw.ffmpeg_path;
+        setFfmpegPath(raw.ffmpeg_path);
+      }
+      if (typeof raw.montage_encoder === "string" && raw.montage_encoder.trim()) {
+        put.montage_encoder = raw.montage_encoder.trim().toLowerCase();
+        setMontageEncoder(put.montage_encoder);
+      }
+      if (typeof raw.cs2_fps_max === "number") {
+        put.cs2_fps_max = raw.cs2_fps_max;
+        setCs2FpsMax(raw.cs2_fps_max);
+      }
+      if (typeof raw.ai_mode === "boolean") {
+        put.ai_mode = raw.ai_mode;
+        setAiMode(raw.ai_mode);
+      }
+      if (Array.isArray(raw.demo_watch_paths)) {
+        put.demo_watch_paths = raw.demo_watch_paths;
+        setDemoWatchPaths(raw.demo_watch_paths);
+      }
+      if (Array.isArray(raw.expected_parse_players)) {
+        put.expected_parse_players = raw.expected_parse_players;
+        setExpectedParsePlayersText(raw.expected_parse_players.join("\n"));
+      }
+      if (Object.keys(put).length) {
+        await API.put("config", put);
+      }
+      if (raw.spec_player_verify && typeof raw.spec_player_verify === "object") {
+        const spv = raw.spec_player_verify;
+        const merged = {
+          demo_timescale: 0.05,
+          max_retries: 4,
+          per_retry_timeout_sec: 0.6,
+          settle_sec: 0.12,
+        };
+        if (typeof spv.demo_timescale === "number" && Number.isFinite(spv.demo_timescale)) {
+          merged.demo_timescale = spv.demo_timescale;
+        }
+        if (typeof spv.max_retries === "number" && Number.isFinite(spv.max_retries)) {
+          merged.max_retries = Math.round(spv.max_retries);
+        }
+        if (typeof spv.per_retry_timeout_sec === "number" && Number.isFinite(spv.per_retry_timeout_sec)) {
+          merged.per_retry_timeout_sec = spv.per_retry_timeout_sec;
+        }
+        if (typeof spv.settle_sec === "number" && Number.isFinite(spv.settle_sec)) {
+          merged.settle_sec = spv.settle_sec;
+        }
+        await API.put("config", { spec_player_verify: merged });
+        setSpecPlayerVerify(merged);
+      }
+      if (raw.llm && typeof raw.llm === "object") {
+        const lm = raw.llm;
+        const payload = {
+          model: String(lm.model ?? "").trim(),
+          base_url: lm.base_url != null ? String(lm.base_url).trim() || null : null,
+        };
+        const k = lm.api_key != null ? String(lm.api_key).trim() : "";
+        if (k && !k.startsWith("****")) {
+          payload.api_key = k;
+        }
+        await API.put("config", { llm: payload });
+        setLlmConfig((prev) => ({
+          model: payload.model,
+          base_url: payload.base_url || "",
+          api_key: payload.api_key ?? prev.api_key,
+        }));
+        if (k && !k.startsWith("****")) {
+          setLlmKeySavedOnServer(true);
+        }
+      }
+      setProgressText("已应用导入的配置。", { autoDismissMs: 2800 });
+    } catch (e) {
+      setProgressText(`导入失败: ${e.response?.data?.detail || e.message}`);
+    }
+  }, []);
+
+  const handleResetSettingsDefaults = useCallback(async () => {
+    if (
+      !window.confirm(
+        "将 CS2/FFmpeg 路径、合辑编码、fps_max、分析模式、关注名单与大模型接口/模型名恢复为默认（不含 OBS 与 Demo 监听目录）。已保存在服务器上的 API 密钥若未在导入文件中提供则仍会保留。确定继续？",
+      )
+    ) {
+      return;
+    }
+    const defaults = {
+      cs2_path: "",
+      ffmpeg_path: "",
+      montage_encoder: "auto",
+      cs2_fps_max: 240,
+      ai_mode: false,
+      expected_parse_players: [],
+      llm: {
+        model: "",
+        base_url: null,
+      },
+    };
+    try {
+      await API.put("config", defaults);
+      setCs2Path("");
+      setFfmpegPath("");
+      setMontageEncoder("auto");
+      setCs2FpsMax(240);
+      setAiMode(false);
+      setExpectedParsePlayersText("");
+      setLlmConfig({
+        model: "",
+        api_key: "",
+        base_url: "",
+      });
+      setProgressText("已恢复默认（路径与解析相关项）。", { autoDismissMs: 3000 });
+    } catch (e) {
+      setProgressText(`恢复默认失败: ${e.response?.data?.detail || e.message}`);
+    }
+  }, []);
+
+  const handleOpenConfigDataDir = useCallback(async () => {
+    try {
+      const { data } = await API.post("config/open-dir");
+      if (data?.ok === false) {
+        setProgressText(`${data.message || "无法打开目录"} ${data.path || ""}`.trim());
+      }
+    } catch (e) {
+      setProgressText(`打开目录失败: ${e.response?.data?.detail || e.message}`);
+    }
+  }, []);
+
+  const handleTestLlmConnection = useCallback(async () => {
+    await persistLlmConfig();
+    try {
+      const { data } = await API.post("config/test-llm");
+      if (data?.ok) {
+        setProgressText(`AI 连接正常${data.detail ? `：${data.detail}` : ""}`, { autoDismissMs: 4000 });
+      } else {
+        setProgressText(`AI 连接失败：${data?.detail || "未知错误"}`);
+      }
+    } catch (e) {
+      setProgressText(`AI 测试请求失败: ${e.response?.data?.detail || e.message}`);
+    }
+  }, [persistLlmConfig]);
+
   const hasDemos = uploadedDemos && uploadedDemos.length > 0;
   const currentFilename = currentUpload?.filename ?? "";
 
@@ -1344,551 +1990,237 @@ export default function App() {
   useEffect(() => {
     setSelectedClientClipUids(new Set());
   }, [currentMatchIndex]);
+  const shell = {
+    aiMode,
+    queue,
+    uploadedDemos,
+    libraryTotal,
+    handleAiModeChange,
+    obsConfig,
+    setObsConfig,
+    persistObsConfig,
+    obsPasswordPlaceholder,
+    handleObsPasswordFocus,
+    handleObsPasswordBlur,
+    llmConfig,
+    setLlmConfig,
+    llmKeySavedOnServer,
+    persistLlmConfig,
+    cs2Path,
+    setCs2Path,
+    ffmpegPath,
+    setFfmpegPath,
+    montageEncoder,
+    setMontageEncoder,
+    cs2FpsMax,
+    setCs2FpsMax,
+    demoWatchPaths,
+    setDemoWatchPaths,
+    handleSaveConfig,
+    handleDetectCs2,
+    handleSaveAllSettingsPage,
+    saveExpectedPlayersFromList,
+    handleExportSettingsConfig,
+    applyImportedSettings,
+    handleResetSettingsDefaults,
+    handleOpenConfigDataDir,
+    handleTestLlmConnection,
+    handleScanDemos,
+    libraryLoading,
+    libraryScanning,
+    expectedParsePlayersText,
+    setExpectedParsePlayersText,
+    handleSaveExpectedParsePlayers,
+    currentDemoFilename,
+    batchRecording,
+    savedRecordWarmupDefaults,
+    persistWarmupDefaults,
+    cs2ExtraLaunchArgs,
+    setCs2ExtraLaunchArgs,
+    recordInjectConsoleLines,
+    setRecordInjectConsoleLines,
+    persistCs2RecordExtras,
+    experimentalPovEnabled,
+    persistExperimentalPov,
+    specPlayerVerify,
+    patchSpecPlayerVerify,
+    hasDemos,
+    parsing,
+    handleUpload,
+    currentFilename,
+    matchTabsData,
+    currentMatchIndex,
+    setCurrentMatchIndex,
+    players,
+    matchMeta,
+    currentParsed,
+    selectedPlayersList,
+    setSelectedPlayers,
+    handleParse,
+    parsingByIndex,
+    analysisInlineProgress,
+    anyDemoParsing,
+    progressText,
+    handleAbortBatchRecording,
+    clips,
+    timeline,
+    roundTimeline,
+    handleAddTimelineEventToQueue,
+    handleAddTimelineRoundToQueue,
+    handleAddTimelineEventsBatchToQueue,
+    selectedClientClipUids,
+    handleToggleClip,
+    queuedClientClipUidsForCurrentDemo,
+    parsedPlayerNames,
+    currentActivePlayer,
+    setActivePlayerTabs,
+    roundMontageMaxRounds,
+    freezeToDeathDraft,
+    setFreezeToDeathDraft,
+    selectedRegularCount,
+    regularSelectableTotal,
+    handleSelectAll,
+    handleDeselectAll,
+    handleAddSelectedToQueue,
+    handleAddAllHighlightsAllMatches,
+    canAddAllHighlights,
+    handleResetDemo,
+    removeFromQueue,
+    clearQueue,
+    openBatchWarmup,
+    demoLibraryItems,
+    setLibrarySearchInput,
+    librarySearchInput,
+    librarySearchQ,
+    setLibrarySearchQ,
+    handleLibrarySearchSubmit,
+    libraryAdvFilters,
+    setLibraryAdvFilters,
+    selectLibraryPage,
+    selectAllLibraryDemos,
+    clearLibrarySelection,
+    handleLoadSelectedLibraryDemos,
+    setLibraryBatchModalOpen,
+    selectedLibraryDemoIds,
+    setSelectedLibraryDemoIds,
+    libraryPage,
+    setLibraryPage,
+    libraryPageSize,
+    setLibraryPageSize,
+    libraryTotalPages,
+    libraryHasNextPage,
+    libraryJumpDraft,
+    setLibraryJumpDraft,
+    handleLibraryPageJump,
+    refreshDemoLibrary,
+    hasLibraryAdvancedFilters,
+    handleLoadDemoFromLibrary,
+    handleDeleteDemo,
+    handleLibraryBatchDelete,
+    setProgressText,
+    handleSaveLibraryRename,
+    setLibraryRename,
+    setLibraryDeletePrompt,
+    libraryRename,
+    libraryDeletePrompt,
+    configBackupStatus,
+    refreshConfigBackupStatus,
+    handleRestorePlayerConfig,
+    handleOpenConfigBackupDir,
+  };
+
+  const hasDemosInline = uploadedDemos && uploadedDemos.length > 0;
+  const parsingShownInline =
+    location.pathname === "/analysis" &&
+    hasDemosInline &&
+    (Boolean(parsingByIndex[currentMatchIndex]) || analysisInlineProgress?.active === true);
+
+  const showGlobalNotice =
+    batchRecording ||
+    Boolean(progressText?.trim()) ||
+    (anyDemoParsing && !parsingShownInline);
 
   return (
-    <div className="relative flex h-screen overflow-hidden bg-cs2-bg-dark">
-      {libraryLoadingOverlay && (
-        <div className="absolute inset-0 z-[70] flex items-center justify-center bg-black/55 backdrop-blur-[1px]">
-          <div className="flex items-center gap-3 rounded-lg border border-white/10 bg-cs2-bg-card px-4 py-3 shadow-2xl">
-            <Loader2 className="h-5 w-5 animate-spin text-cs2-orange" />
-            <p className="text-sm font-medium text-zinc-200">{libraryLoadingText}</p>
+    <AppShellProvider value={shell}>
+      <div className="relative flex h-screen overflow-hidden bg-cs2-bg-dark">
+        {libraryLoadingOverlay && (
+          <div className="absolute inset-0 z-[70] flex items-center justify-center bg-black/55 backdrop-blur-[1px]">
+            <div className="flex items-center gap-3 rounded-lg border border-white/10 bg-cs2-bg-card px-4 py-3 shadow-2xl">
+              <Loader2 className="h-5 w-5 animate-spin text-cs2-orange" />
+              <p className="text-sm font-medium text-zinc-200">{libraryLoadingText}</p>
+            </div>
           </div>
-        </div>
-      )}
-      <Sidebar
-        aiMode={aiMode}
-        onAiModeChange={handleAiModeChange}
-        obsConfig={obsConfig}
-        onObsConfigChange={setObsConfig}
-        onPersistObs={persistObsConfig}
-        obsPasswordPlaceholder={obsPasswordPlaceholder}
-        onObsPasswordFocus={handleObsPasswordFocus}
-        onObsPasswordBlur={handleObsPasswordBlur}
-        llmConfig={llmConfig}
-        onLlmConfigChange={setLlmConfig}
-        llmKeySavedOnServer={llmKeySavedOnServer}
-        onPersistLlm={persistLlmConfig}
-        cs2Path={cs2Path}
-        onCs2PathChange={setCs2Path}
-        cs2FpsMax={cs2FpsMax}
-        onCs2FpsMaxChange={setCs2FpsMax}
-        demoWatchPaths={demoWatchPaths}
-        onDemoWatchPathsChange={setDemoWatchPaths}
-        onSaveConfig={handleSaveConfig}
-        onDetectCs2={handleDetectCs2}
-        onScanDemos={handleScanDemos}
-        demoLibraryLoading={libraryLoading}
-        expectedParsePlayersText={expectedParsePlayersText}
-        onExpectedParsePlayersTextChange={setExpectedParsePlayersText}
-        onSaveExpectedParsePlayers={handleSaveExpectedParsePlayers}
-      />
-
-      <main className="flex flex-1 flex-col overflow-hidden">
-        {hasDemos && (
-          <header className="flex shrink-0 items-center justify-between gap-3 border-b border-white/10 bg-cs2-bg-dark/90 px-4 py-2.5 backdrop-blur-md sm:px-5">
-            <p className="min-w-0 truncate text-[11px] text-zinc-500">
-              <span className="font-mono text-zinc-400">{uploadedDemos.length}</span> 个 Demo 已导入
-            </p>
-            <div className="flex shrink-0 items-center gap-2">
-              <button
-                type="button"
-                onClick={() => setCommonParamsOpen(true)}
-                disabled={batchRecording}
-                className="flex items-center gap-1.5 rounded-md border border-cs2-border bg-cs2-bg-input px-2.5 py-1.5 text-[11px] font-semibold text-zinc-300 transition-colors hover:border-cs2-orange/45 hover:text-white disabled:opacity-40"
-              >
-                <SlidersHorizontal className="h-3.5 w-3.5" />
-                常用参数管理
-              </button>
-              <button
-                type="button"
-                onClick={handleResetDemo}
-                disabled={anyDemoParsing || batchRecording}
-                className="flex items-center gap-1.5 rounded-md border border-cs2-border bg-cs2-bg-input px-2.5 py-1.5 text-[11px] font-semibold text-zinc-300 transition-colors hover:border-cs2-orange/45 hover:text-white disabled:opacity-40"
-              >
-                <RefreshCw className="h-3.5 w-3.5" />
-                更换 Demo
-              </button>
-              <button
-                type="button"
-                onClick={() => setQueueDrawerOpen(true)}
-                disabled={batchRecording}
-                className="flex items-center gap-1.5 rounded-md border border-cs2-orange/45 bg-cs2-orange/10 px-2.5 py-1.5 text-[11px] font-bold text-cs2-orange transition-colors hover:border-cs2-orange hover:bg-cs2-orange/15 disabled:opacity-40"
-              >
-                <Package className="h-3.5 w-3.5" />
-                录制队列
-                <span className="rounded bg-cs2-orange/25 px-1.5 font-mono text-[10px] text-white tabular-nums">
-                  {queue.length}
-                </span>
-              </button>
-            </div>
-          </header>
         )}
+        <SidebarNav queueLength={queue.length} disabled={batchRecording} />
+        <main className="flex min-w-0 flex-1 flex-col overflow-hidden">
+          <div className="min-h-0 flex-1 overflow-hidden">
+            <Routes>
+              <Route path="/" element={<GuidePage />} />
+              <Route path="/library" element={<DemoLibraryPage />} />
+              <Route path="/analysis" element={<AnalysisPage />} />
+              <Route path="/queue" element={<RecordingQueuePage />} />
+              <Route path="/montage" element={<MontageWorkbenchPage />} />
+              <Route path="/params" element={<CommonParamsPage />} />
+              <Route path="/obs-config-center" element={<ObsConfigCenterPage />} />
+              <Route path="/settings" element={<SettingsPage />} />
+              <Route path="/player-game-config" element={<PlayerGameConfigPage />} />
+              <Route path="*" element={<Navigate to="/" replace />} />
+            </Routes>
+          </div>
+        </main>
 
-        <div className="flex-1 space-y-5 overflow-y-auto px-4 pb-6 pt-3 sm:px-5 sm:pt-4">
-          <section className="rounded-lg border border-white/10 bg-cs2-bg-card p-3">
-            <div className="mb-2 flex items-center justify-between">
-              <h3 className="text-xs font-semibold text-zinc-300">本地 Demo 库</h3>
-              <div className="flex max-w-[min(100%,28rem)] flex-wrap items-center justify-end gap-1">
-                <button
-                  type="button"
-                  disabled={libraryLoading}
-                  className="inline-flex items-center gap-1 rounded border border-cs2-border bg-cs2-bg-input px-2 py-1 text-[10px] font-semibold hover:border-cs2-orange/50 disabled:opacity-50"
-                  onClick={() => void handleScanDemos()}
-                >
-                  <FolderSync className={`h-3 w-3 ${libraryLoading ? "animate-spin" : ""}`} />
-                  刷新
-                </button>
-                <button
-                  type="button"
-                  disabled={demoLibraryItems.length === 0}
-                  className="rounded border border-cs2-border px-2 py-1 text-[10px] font-semibold text-zinc-400 hover:border-cs2-orange/50 hover:text-zinc-200 disabled:opacity-40"
-                  onClick={selectLibraryPage}
-                >
-                  本页全选
-                </button>
-                <button
-                  type="button"
-                  disabled={libraryLoading || (libraryTotal != null && libraryTotal === 0)}
-                  className="rounded border border-cs2-border px-2 py-1 text-[10px] font-semibold text-zinc-400 hover:border-cs2-orange/50 hover:text-zinc-200 disabled:opacity-40"
-                  onClick={() => void selectAllLibraryDemos()}
-                >
-                  全选库内
-                </button>
-                <button
-                  type="button"
-                  disabled={selectedLibraryDemoIds.size === 0}
-                  className="rounded border border-cs2-border px-2 py-1 text-[10px] font-semibold text-zinc-400 hover:border-cs2-orange/50 hover:text-zinc-200 disabled:opacity-40"
-                  onClick={clearLibrarySelection}
-                >
-                  清空
-                </button>
-                <button
-                  type="button"
-                  disabled={selectedLibraryDemoIds.size === 0}
-                  className="inline-flex items-center gap-1 rounded border border-emerald-500/40 bg-emerald-500/10 px-2 py-1 text-[10px] font-semibold text-emerald-400 hover:border-emerald-500/70 disabled:opacity-40"
-                  onClick={() => void handleLoadSelectedLibraryDemos()}
-                >
-                  载入选中({selectedLibraryDemoIds.size})
-                </button>
-                <button
-                  type="button"
-                  disabled={selectedLibraryDemoIds.size === 0}
-                  className="inline-flex items-center gap-1 rounded border border-cs2-orange/45 bg-cs2-orange/10 px-2 py-1 text-[10px] font-bold text-cs2-orange hover:border-cs2-orange/70 disabled:opacity-40"
-                  onClick={() => setLibraryBatchModalOpen(true)}
-                >
-                  载入并解析…
-                </button>
-              </div>
-            </div>
-            <div className="mb-2 flex items-center gap-2 rounded border border-white/10 bg-cs2-bg-input/40 px-2 py-1.5">
-              <Search className="h-3.5 w-3.5 shrink-0 text-zinc-500" aria-hidden />
-              <input
-                type="search"
-                enterKeyHint="search"
-                className="min-w-0 flex-1 bg-transparent text-[11px] text-zinc-200 outline-none placeholder:text-zinc-600"
-                placeholder="按文件名或展示名搜索…"
-                value={librarySearchInput}
-                onChange={(e) => setLibrarySearchInput(e.target.value)}
-                aria-label="搜索 Demo 名称"
+        {showGlobalNotice ? (
+          <div
+            className="pointer-events-none fixed inset-x-0 bottom-0 z-[60] flex justify-center px-4 pb-[max(1rem,env(safe-area-inset-bottom))] pt-2 sm:px-6"
+            aria-live="polite"
+          >
+            <div className="pointer-events-auto w-full max-w-lg shadow-2xl shadow-black/50">
+              <ProgressBar
+                text={progressText || (batchRecording ? "正在批量录制…" : "")}
+                active={anyDemoParsing}
+                batchRecording={batchRecording}
+                onAbortBatch={handleAbortBatchRecording}
+                dismissible={Boolean(progressText?.trim())}
+                onDismiss={() => setProgressText("")}
+                autoDismissAfterMs={progressToastMeta?.autoDismissMs ?? undefined}
+                showQueueNavigate={Boolean(progressToastMeta?.queueLink)}
               />
             </div>
-            <div className="space-y-1">
-              {demoLibraryItems.length === 0 && !libraryLoading && (
-                <p className="text-[11px] text-cs2-text-secondary">
-                  {librarySearchQ
-                    ? `没有名称包含「${librarySearchQ}」的 Demo。`
-                    : "暂无数据，配置监听路径后会自动入库。"}
-                </p>
-              )}
-              {demoLibraryItems.map((it) => (
-                <div
-                  key={it.id}
-                  className="flex items-center justify-between rounded border border-white/10 bg-cs2-bg-input/50 px-2 py-1.5 text-[11px]"
-                >
-                  <div className="flex min-w-0 items-center gap-2">
-                    <input
-                      type="checkbox"
-                      checked={selectedLibraryDemoIds.has(it.id)}
-                      onChange={(e) => {
-                        const checked = e.target.checked;
-                        setSelectedLibraryDemoIds((prev) => {
-                          const next = new Set(prev);
-                          if (checked) next.add(it.id);
-                          else next.delete(it.id);
-                          return next;
-                        });
-                      }}
-                    />
-                    <div className="min-w-0">
-                      <p className="truncate font-mono text-zinc-300">
-                        {(it.display_name && String(it.display_name).trim()) || it.filename}
-                      </p>
-                      {it.display_name && String(it.display_name).trim() ? (
-                        <p className="truncate text-[10px] text-zinc-500" title={it.path}>
-                          文件: {it.filename}
-                        </p>
-                      ) : null}
-                      <p className="text-[10px] text-cs2-text-secondary">{it.status}</p>
-                    </div>
-                  </div>
-                  <div className="flex items-center gap-1">
-                    <button
-                      type="button"
-                      className="rounded border border-cs2-border px-1.5 py-0.5 text-[10px] hover:border-cs2-orange/50"
-                      title="仅改库中展示名"
-                      onClick={() =>
-                        setLibraryRename({
-                          id: it.id,
-                          draft: (it.display_name && String(it.display_name).trim()) || "",
-                        })
-                      }
-                    >
-                      <Pencil className="h-3 w-3" />
-                    </button>
-                    <button
-                      type="button"
-                      className="rounded border border-cs2-border px-1.5 py-0.5 text-[10px] hover:border-emerald-500/60"
-                      onClick={() => void handleLoadDemoFromLibrary([it])}
-                    >
-                      选择
-                    </button>
-                    <button
-                      type="button"
-                      className="rounded border border-cs2-border px-1.5 py-0.5 text-[10px] hover:border-cs2-orange/50"
-                      onClick={() => void handleReparseDemo(it.id)}
-                    >
-                      <RotateCw className="h-3 w-3" />
-                    </button>
-                    <button
-                      type="button"
-                      className="rounded border border-cs2-border px-1.5 py-0.5 text-[10px] hover:border-cs2-fail"
-                      onClick={() =>
-                        setLibraryDeletePrompt({
-                          id: it.id,
-                          label:
-                            (it.display_name && String(it.display_name).trim()) || it.filename || `#${it.id}`,
-                        })
-                      }
-                    >
-                      <Trash2 className="h-3 w-3" />
-                    </button>
-                  </div>
-                </div>
-              ))}
-            </div>
-            <div className="mt-2 flex flex-wrap items-center justify-end gap-x-1 gap-y-1.5">
-              <button
-                type="button"
-                disabled={libraryPage <= 1}
-                className="rounded border border-cs2-border px-1.5 py-1 text-[10px] disabled:opacity-40"
-                onClick={() => {
-                  const next = Math.max(1, libraryPage - 1);
-                  setLibraryPage(next);
-                  void refreshDemoLibrary(next);
-                }}
-              >
-                <ChevronLeft className="h-3 w-3" />
-              </button>
-              <span className="px-2 text-[10px] text-zinc-500">
-                {libraryTotalPages == null
-                  ? `第 ${libraryPage} 页`
-                  : `第 ${libraryPage} / ${libraryTotalPages} 页`}
-              </span>
-              <button
-                type="button"
-                disabled={!libraryHasNextPage}
-                className="rounded border border-cs2-border px-1.5 py-1 text-[10px] disabled:opacity-40"
-                onClick={() => {
-                  const next = libraryPage + 1;
-                  setLibraryPage(next);
-                  void refreshDemoLibrary(next);
-                }}
-              >
-                <ChevronRight className="h-3 w-3" />
-              </button>
-              <form
-                className="flex items-center gap-1 border-l border-white/10 pl-2"
-                onSubmit={(e) => {
-                  e.preventDefault();
-                  handleLibraryPageJump();
-                }}
-              >
-                <span className="text-[10px] text-zinc-600">跳至</span>
-                <input
-                  type="text"
-                  inputMode="numeric"
-                  className="w-9 rounded border border-cs2-border bg-cs2-bg-input px-1 py-0.5 text-center font-mono text-[10px] text-zinc-200 outline-none focus:border-cs2-orange/50"
-                  value={libraryJumpDraft}
-                  onChange={(e) => setLibraryJumpDraft(e.target.value.replace(/\D/g, "").slice(0, 5))}
-                  placeholder="页"
-                  aria-label="跳转页码"
-                />
-                <button
-                  type="submit"
-                  className="rounded border border-cs2-border px-1.5 py-1 text-[10px] font-semibold text-zinc-400 hover:border-cs2-orange/50 hover:text-zinc-200"
-                >
-                  跳转
-                </button>
-              </form>
-            </div>
-          </section>
+          </div>
+        ) : null}
 
-          {libraryDeletePrompt ? (
-            <div
-              className="fixed inset-0 z-[100] flex items-center justify-center bg-black/55 px-4"
-              role="dialog"
-              aria-modal="true"
-              aria-labelledby="library-delete-title"
-              onClick={() => setLibraryDeletePrompt(null)}
-            >
-              <div
-                className="w-full max-w-md rounded-lg border border-white/15 bg-cs2-bg-card p-4 shadow-xl"
-                onClick={(e) => e.stopPropagation()}
-              >
-                <h4 id="library-delete-title" className="mb-2 text-xs font-semibold text-zinc-300">
-                  从 Demo 库删除
-                </h4>
-                <p className="mb-3 font-mono text-[11px] text-zinc-400">{libraryDeletePrompt.label}</p>
-                <p className="mb-3 text-[10px] leading-relaxed text-cs2-text-secondary">
-                  仅移除本地库中的记录与解析缓存，不会删除磁盘上的 .dem 文件。请选择删除之后再次扫描时的行为：
-                </p>
-                <div className="flex flex-col gap-2">
-                  <button
-                    type="button"
-                    className="rounded border border-emerald-500/40 bg-emerald-500/10 px-3 py-2 text-left text-[11px] leading-snug text-emerald-200/95 hover:bg-emerald-500/20"
-                    onClick={() => void handleDeleteDemo(libraryDeletePrompt.id, "reimport")}
-                  >
-                    删除后再次扫描仍入库
-                    <span className="mt-0.5 block text-[10px] font-normal text-zinc-500">
-                      下次扫描会重新加入库中，入库时间为扫描时刻。
-                    </span>
-                  </button>
-                  <button
-                    type="button"
-                    className="rounded border border-white/15 px-3 py-2 text-left text-[11px] leading-snug text-zinc-300 hover:bg-white/[0.06]"
-                    onClick={() => void handleDeleteDemo(libraryDeletePrompt.id, "skip")}
-                  >
-                    删除后再次扫描不再入库
-                    <span className="mt-0.5 block text-[10px] font-normal text-zinc-500">
-                      之后目录监听与手动扫描都会跳过该路径；仅改文件名或移动文件可视为新路径再入库。
-                    </span>
-                  </button>
-                </div>
-                <div className="mt-4 flex justify-end">
-                  <button
-                    type="button"
-                    className="rounded border border-cs2-border px-2 py-1 text-[11px] text-zinc-400 hover:text-zinc-200"
-                    onClick={() => setLibraryDeletePrompt(null)}
-                  >
-                    取消
-                  </button>
-                </div>
-              </div>
-            </div>
-          ) : null}
+        <RecordWarmupModal
+          open={recordWarmupOpen}
+          onClose={() => {
+            setRecordWarmupOpen(false);
+            setWarmupIntent(null);
+          }}
+          onConfirm={handleWarmupConfirm}
+          defaultOverrides={savedRecordWarmupDefaults ?? undefined}
+          experimentalPovEnabled={experimentalPovEnabled}
+          onExperimentalPovChange={persistExperimentalPov}
+          cs2ExtraLaunchArgs={cs2ExtraLaunchArgs}
+          onCs2ExtraLaunchArgsChange={setCs2ExtraLaunchArgs}
+          recordInjectConsoleLines={recordInjectConsoleLines}
+          onRecordInjectConsoleLinesChange={setRecordInjectConsoleLines}
+          onPersistCs2RecordExtras={persistCs2RecordExtras}
+        />
 
-          {libraryRename ? (
-            <div
-              className="fixed inset-0 z-[100] flex items-center justify-center bg-black/55 px-4"
-              role="dialog"
-              aria-modal="true"
-              aria-labelledby="library-rename-title"
-              onClick={() => setLibraryRename(null)}
-            >
-              <div
-                className="w-full max-w-sm rounded-lg border border-white/15 bg-cs2-bg-card p-4 shadow-xl"
-                onClick={(e) => e.stopPropagation()}
-              >
-                <h4 id="library-rename-title" className="mb-2 text-xs font-semibold text-zinc-300">
-                  Demo 展示名
-                </h4>
-                <p className="mb-2 text-[10px] leading-relaxed text-cs2-text-secondary">
-                  仅保存在本地库中，不修改磁盘上的 .dem 文件名。留空并保存则恢复为文件名显示。
-                </p>
-                <input
-                  type="text"
-                  className="mb-3 w-full rounded border border-cs2-border bg-cs2-bg-input px-2 py-1.5 font-mono text-[11px] text-zinc-200 outline-none focus:border-cs2-orange/50"
-                  value={libraryRename.draft}
-                  onChange={(e) =>
-                    setLibraryRename((prev) => (prev ? { ...prev, draft: e.target.value } : null))
-                  }
-                  maxLength={512}
-                  autoFocus
-                />
-                <div className="flex justify-end gap-2">
-                  <button
-                    type="button"
-                    className="rounded border border-cs2-border px-2 py-1 text-[11px] text-zinc-400 hover:text-zinc-200"
-                    onClick={() => setLibraryRename(null)}
-                  >
-                    取消
-                  </button>
-                  <button
-                    type="button"
-                    className="rounded border border-cs2-orange/50 bg-cs2-orange/15 px-2 py-1 text-[11px] font-semibold text-cs2-orange hover:bg-cs2-orange/25"
-                    onClick={() => void handleSaveLibraryRename()}
-                  >
-                    保存
-                  </button>
-                </div>
-              </div>
-            </div>
-          ) : null}
+        <LibraryLoadModeModal
+          open={libraryBatchModalOpen}
+          onClose={() => setLibraryBatchModalOpen(false)}
+          expectedPreviewLines={expectedPreviewLines}
+          onConfirm={(payload) => {
+            setLibraryBatchModalOpen(false);
+            void runLibraryBatchLoad(payload);
+          }}
+        />
 
-          {!hasDemos && !parsing && <DemoUpload onUpload={handleUpload} />}
-          {!hasDemos && parsing && (
-            <div className="flex flex-col items-center justify-center rounded-xl border border-white/10 bg-cs2-bg-card py-16 text-center">
-              <Loader2 className="h-9 w-9 animate-spin text-cs2-orange" aria-hidden />
-              <p className="mt-4 text-sm font-medium text-zinc-300">正在处理 Demo…</p>
-            </div>
-          )}
-
-          {hasDemos && (
-            <div className="space-y-3">
-              <div className="rounded-lg border border-white/10 bg-cs2-bg-card px-3 py-3">
-                <div className="mb-2 flex flex-wrap items-center gap-2 text-[11px] text-cs2-text-secondary">
-                  <span className="shrink-0 font-semibold text-zinc-400">当前场次</span>
-                  <span className="truncate font-mono text-zinc-300" title={currentFilename}>
-                    {currentFilename}
-                  </span>
-                  {currentParsed && (
-                    <span className="rounded border border-emerald-500/30 bg-emerald-500/10 px-1.5 py-0 text-[10px] font-semibold text-emerald-400/90">
-                      已解析
-                    </span>
-                  )}
-                  {uploadedDemos.length > 1 && (
-                    <span className="rounded border border-white/10 px-1.5 py-0 text-[10px] text-zinc-500">
-                      共 {uploadedDemos.length} 个文件
-                    </span>
-                  )}
-                </div>
-                <MatchSwitcher
-                  matches={matchTabsData}
-                  currentIndex={currentMatchIndex}
-                  onChange={setCurrentMatchIndex}
-                  disabled={batchRecording}
-                />
-              </div>
-
-              {players.length > 0 && (
-                <div className="space-y-4">
-                  {matchMeta && <MatchScoreboard matchMeta={matchMeta} />}
-                  <PlayerSelect
-                    players={players}
-                    selected={selectedPlayersList}
-                    onSelect={(name) =>
-                      setSelectedPlayers((prev) => {
-                        const cur = prev[currentMatchIndex] ?? [];
-                        const next = cur.includes(name)
-                          ? cur.filter((n) => n !== name)
-                          : [...cur, name];
-                        return { ...prev, [currentMatchIndex]: next };
-                      })
-                    }
-                    onAnalyze={handleParse}
-                    disabled={
-                      batchRecording ||
-                      parsing ||
-                      Boolean(parsingByIndex[currentMatchIndex])
-                    }
-                  />
-                </div>
-              )}
-            </div>
-          )}
-
-          {(anyDemoParsing || progressText || batchRecording) && (
-            <ProgressBar
-              text={progressText || (batchRecording ? "正在批量录制…" : "")}
-              active={anyDemoParsing}
-              batchRecording={batchRecording}
-              onAbortBatch={handleAbortBatchRecording}
-            />
-          )}
-          {(clips.length > 0 || parsedPlayerNames.length > 0) && currentParsed && (
-            <ClipList
-              clips={clips}
-              targetPlayer={matchMeta?.target_player ?? ""}
-              selectedIds={selectedClientClipUids}
-              onToggle={handleToggleClip}
-              aiMode={aiMode}
-              queuedClientClipUids={queuedClientClipUidsForCurrentDemo}
-              playerTabs={parsedPlayerNames}
-              activePlayerTab={currentActivePlayer}
-              onPlayerTabChange={(name) =>
-                setActivePlayerTabs((prev) => ({ ...prev, [currentMatchIndex]: name }))
-              }
-              parsedPlayers={currentParsed?.players ?? {}}
-            />
-          )}
-        </div>
-
-        {clips.length > 0 && (
-          <ActionBar
-            selectedCount={selectedRegularCount}
-            totalCount={regularSelectableTotal}
-            hasSelection={selectedClientClipUids.size > 0}
-            onSelectAll={handleSelectAll}
-            onDeselectAll={handleDeselectAll}
-            onAddSelectedToQueue={handleAddSelectedToQueue}
-            onAddAllHighlightsAllMatches={handleAddAllHighlightsAllMatches}
-            queueLength={queue.length}
-            batchRecording={batchRecording}
-            canAddAllHighlights={Boolean(
-              parsedMatches?.some((pm) =>
-                Object.values(pm?.players ?? {}).some((pd) =>
-                  pd.clips?.some((c) => c.category === "highlight")
-                )
-              )
-            )}
-          />
-        )}
-      </main>
-
-      <CommonParamsModal
-        open={commonParamsOpen}
-        onClose={() => setCommonParamsOpen(false)}
-        batchRecording={batchRecording}
-        savedWarmupDefaults={savedRecordWarmupDefaults}
-        onPersistWarmupDefaults={persistWarmupDefaults}
-      />
-
-      <RecordingQueueDrawer
-        open={queueDrawerOpen}
-        onClose={() => setQueueDrawerOpen(false)}
-        queue={queue}
-        onRemove={removeFromQueue}
-        onClear={clearQueue}
-        onStartBatch={openBatchWarmup}
-        batchRecording={batchRecording}
-        onAbortBatch={handleAbortBatchRecording}
-      />
-
-      <RecordWarmupModal
-        open={recordWarmupOpen}
-        onClose={() => {
-          setRecordWarmupOpen(false);
-          setWarmupIntent(null);
-        }}
-        onConfirm={handleWarmupConfirm}
-        onWarmupValidationError={(msg) => setRecordingBlockedMessage(msg)}
-        defaultOverrides={savedRecordWarmupDefaults ?? undefined}
-      />
-
-      <LibraryLoadModeModal
-        open={libraryBatchModalOpen}
-        onClose={() => setLibraryBatchModalOpen(false)}
-        expectedPreviewLines={expectedPreviewLines}
-        onConfirm={(payload) => {
-          setLibraryBatchModalOpen(false);
-          void runLibraryBatchLoad(payload);
-        }}
-      />
-
-      <RecordingBlockedDialog
-        message={recordingBlockedMessage}
-        onClose={() => setRecordingBlockedMessage("")}
-      />
-    </div>
+        <RecordingBlockedDialog
+          message={recordingBlockedMessage}
+          onClose={() => setRecordingBlockedMessage("")}
+        />
+      </div>
+    </AppShellProvider>
   );
 }

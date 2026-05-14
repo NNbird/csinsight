@@ -2,11 +2,9 @@ import { create } from "zustand";
 
 /**
  * @typedef {Object} PacingOverride
- * @property {number} [pre_first_sec]   首杀前预滚（秒）
- * @property {number} [post_last_sec]   末杀后留白（秒）
+ * @property {number} [pre_first_sec]   击杀前预留（秒），每段首杀前回拨
+ * @property {number} [post_last_sec]   击杀后预留（秒），每段末杀后收束（含智能跳剪中段）
  * @property {number} [max_gap_sec]     智能分段最大击杀间隔（秒）
- * @property {number} [post_mid_sec]    中间击杀后停顿（秒），闪切前保留
- * @property {number} [pre_cont_sec]    跳跃后切入缓冲（秒），闪切后至下次开枪
  * @property {boolean} [victim_pov]     是否追加 POV（高光→受害者、失误→击杀者）
  * @property {number} [victim_pov_pre_sec]
  * @property {number} [victim_pov_post_sec]
@@ -16,14 +14,12 @@ import { create } from "zustand";
 
 /**
  * 全局节奏默认值，与后端 build_smart_jump_segments 的硬编码默认值保持一致：
- *   PRE_FIRST = 5.5s  POST_LAST = 3.0s  MAX_GAP = 12s  POST_MID = 1.5s  PRE_CONT = 5.0s
+ *   PRE_FIRST = 5.5s  POST_LAST = 3.0s  MAX_GAP = 12s；续段预滚同 PRE_FIRST；中段末杀后留白同 POST_LAST
  */
 export const BACKEND_DEFAULT_PACING = {
   pre_first_sec: 5.5,
   post_last_sec: 3.0,
   max_gap_sec: 12,
-  post_mid_sec: 2,
-  pre_cont_sec: 5.0,
 };
 
 /**
@@ -37,6 +33,7 @@ export const BACKEND_DEFAULT_PACING = {
  * @property {string} clipId
  * @property {string} clientClipUid 与列表里 clip.client_clip_uid 一致，用于入队/出队与 UI 同步
  * @property {Object} clipData
+ * @property {number[]} [freezeToDeathQueueRounds] 回合合集入队时勾选的回合（仅展示）
  * @property {number} [clipData.score_own] 本回合开局目标方胜场
  * @property {number} [clipData.score_opp] 本回合开局对方胜场
  * @property {PacingOverride} [pacing_override] 单片段剪辑节奏覆写（优先级高于全局节奏）
@@ -62,6 +59,13 @@ export function clipVictimPovEnqueueEligible(clipData) {
 /** 与队列抽屉「击杀者视角」资格判定一致 */
 export function clipKillerPovEnqueueEligible(clipData) {
   if (!clipData || typeof clipData !== "object") return false;
+  // 回合时间线上的「被击杀」条目：主段已锚在死亡附近，自动追加击杀者 POV 会像又切到别人身上。
+  if (
+    String(clipData.timeline_source || "").trim() === "round_timeline_event" &&
+    String(clipData.timeline_record_kind || "").trim() === "death"
+  ) {
+    return false;
+  }
   const killers = Array.isArray(clipData.killers) ? clipData.killers : [];
   const hasKillerList = killers.some((v) => String(v ?? "").trim().length > 0);
   const kind = clipData.compilation_kind;
@@ -134,13 +138,33 @@ export const useRecordingQueue = create((set, get) => ({
     set((s) => ({ queue: s.queue.filter((q) => q.id !== id) }));
   },
 
+  /**
+   * 拖拽重排：将 `fromIndex` 移至 `toIndex`（0-based，与列表渲染顺序一致）。
+   * @param {number} fromIndex
+   * @param {number} toIndex
+   */
+  reorderQueue(fromIndex, toIndex) {
+    set((s) => {
+      const n = s.queue.length;
+      if (n <= 1) return s;
+      const a = Math.floor(Number(fromIndex));
+      const b = Math.floor(Number(toIndex));
+      if (!Number.isFinite(a) || !Number.isFinite(b)) return s;
+      if (a < 0 || a >= n || b < 0 || b >= n || a === b) return s;
+      const next = [...s.queue];
+      const [item] = next.splice(a, 1);
+      next.splice(b, 0, item);
+      return { queue: next };
+    });
+  },
+
   clearQueue() {
     set({ queue: [] });
   },
 
   /**
    * 合并单片段剪辑节奏；可传部分字段。支持的键：
-   * pre_first_sec, post_last_sec, max_gap_sec, post_mid_sec, pre_cont_sec
+   * pre_first_sec, post_last_sec, max_gap_sec
    * @param {string} id
    * @param {PacingOverride} pacingConfig
    */
@@ -173,7 +197,7 @@ export const useRecordingQueue = create((set, get) => ({
   },
 
   /**
-   * 重置「智能分段」数值（开场预留 / 结尾留白 / 防跳剪阈值），保留入队默认开关与 POV 时序默认值。
+   * 重置「智能分段」数值（击杀前预留 / 击杀后预留 / 防跳剪阈值），保留入队默认开关与 POV 时序默认值。
    */
   resetGlobalPacing() {
     set((s) => {
@@ -195,7 +219,7 @@ export const useRecordingQueue = create((set, get) => ({
   },
 
   /**
-   * 从 cs2-insight.config.json / GET /api/config 一次性替换全局节奏（非合并）。
+   * 从 data/cs2-insight.config.json / GET /api/config 一次性替换全局节奏（非合并）。
    * @param {Record<string, unknown>} obj
    */
   hydrateGlobalPacing(obj) {
